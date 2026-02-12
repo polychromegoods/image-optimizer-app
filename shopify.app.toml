@@ -1,27 +1,38 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# This file stores configurations for your Shopify app.
 
-client_id = "245ba33ff3fdd13456646e458c9332e0"
-name = "Image Compression WebPro"
-application_url = "https://image-optimizer-app-production.up.railway.app"
-embedded = true
-
-[build]
-automatically_update_urls_on_dev = true
+scopes = "read_products,write_products,write_files,read_files"
 
 [webhooks]
-api_version = "2026-04"
+api_version = "2024-10"
 
+  # Handled by: /app/routes/webhooks.app.uninstalled.tsx
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = ["app/uninstalled"]
+
+  # Handled by: /app/routes/webhooks.app.scopes_update.tsx
   [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
-  [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
+  # Webhooks can have filters
+  # Only receive webhooks for product updates with a product price >= 10.00
+  # See: https://shopify.dev/docs/apps/build/webhooks/customize/filters
+  # [[webhooks.subscriptions]]
+  # topics = ["products/update"]
+  # uri = "/webhooks/products/update"
+  # filter = "variants.price:>=10.00"
 
-[access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_files,read_products,write_files,write_products"
+  # Mandatory compliance topic for public apps only
+  # See: https://shopify.dev/docs/apps/build/privacy-law-compliance
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/customers/data_request"
+  # compliance_topics = ["customers/data_request"]
 
-[auth]
-redirect_urls = [ "https://image-optimizer-app-production.up.railway.app/auth/callback" ]
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/customers/redact"
+  # compliance_topics = ["customers/redact"]
+
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/shop/redact"
+  # compliance_topics = ["shop/redact"]
