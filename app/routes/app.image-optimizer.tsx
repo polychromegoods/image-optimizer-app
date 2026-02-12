@@ -10,10 +10,10 @@ import {
   Text,
   Banner,
   ProgressBar,
-  DataTable,
   Badge,
   InlineStack,
   Modal,
+  Thumbnail,
   Box,
 } from "@shopify/polaris";
 import { useState, useCallback } from "react";
@@ -23,7 +23,7 @@ import sharp from "sharp";
 
 function applyTemplate(
   template: string,
-  variables: Record<string, string>
+  variables: Record<string, string>,
 ): string {
   let result = template;
   for (const [key, value] of Object.entries(variables)) {
@@ -48,7 +48,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  // Get optimization statistics
   const stats = await db.imageOptimization.groupBy({
     by: ["status"],
     where: { shop },
@@ -60,10 +59,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const recentOptimizations = await db.imageOptimization.findMany({
     where: { shop },
     orderBy: { updatedAt: "desc" },
-    take: 20,
+    take: 50,
   });
 
-  // Fetch products with images
   const response = await admin.graphql(
     `#graphql
       query getProducts($first: Int!) {
@@ -96,20 +94,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         }
       }
     `,
-    { variables: { first: 250 } }
+    { variables: { first: 250 } },
   );
 
   const data = await response.json();
   const products = data.data?.products?.edges?.map((e: any) => e.node) || [];
 
-  // Count total images and new (unoptimized) images
   let totalImages = 0;
   let newImages = 0;
 
   for (const product of products) {
-    const mediaImages = product.media?.edges
-      ?.map((e: any) => e.node)
-      ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
+    const mediaImages =
+      product.media?.edges
+        ?.map((e: any) => e.node)
+        ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
 
     totalImages += mediaImages.length;
 
@@ -129,7 +127,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  // Get SEO settings
   const seoSettings = await db.seoSettings.findUnique({
     where: { shop },
   });
@@ -155,13 +152,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ success: true, message: "Refreshed" });
   }
 
-  if (actionType === "optimize_new") {
-    // Get SEO settings
+  if (actionType === "optimize_new" || actionType === "retry_single") {
     const seoSettings = await db.seoSettings.findUnique({
       where: { shop },
     });
 
-    // Get shop name
     const shopResponse = await admin.graphql(
       `#graphql
         query {
@@ -169,12 +164,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             name
           }
         }
-      `
+      `,
     );
     const shopData = await shopResponse.json();
     const shopName = shopData.data?.shop?.name || shop;
 
-    // Get all products with media
+    let targetImageId: string | null = null;
+    if (actionType === "retry_single") {
+      targetImageId = formData.get("imageId") as string;
+    }
+
     const response = await admin.graphql(
       `#graphql
         query getProducts($first: Int!) {
@@ -207,7 +206,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           }
         }
       `,
-      { variables: { first: 250 } }
+      { variables: { first: 250 } },
     );
 
     const data = await response.json();
@@ -220,15 +219,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const product of products) {
       const productId = product.id;
-      const mediaImages = product.media?.edges
-        ?.map((e: any) => e.node)
-        ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
+      const mediaImages =
+        product.media?.edges
+          ?.map((e: any) => e.node)
+          ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
 
       for (let i = 0; i < mediaImages.length; i++) {
         const media = mediaImages[i];
 
+        if (targetImageId && media.id !== targetImageId) {
+          continue;
+        }
+
         try {
-          // Check if already optimized
           const existing = await db.imageOptimization.findUnique({
             where: {
               shop_imageId: {
@@ -238,12 +241,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             },
           });
 
-          if (existing && existing.status === "completed") {
+          if (actionType === "optimize_new" && existing && existing.status === "completed") {
             skippedCount++;
             continue;
           }
 
-          // Create or update record as processing
           await db.imageOptimization.upsert({
             where: {
               shop_imageId: {
@@ -266,7 +268,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             },
           });
 
-          // Build template variables
           const templateVars = {
             product_name: product.title || "",
             vendor: product.vendor || "",
@@ -277,7 +278,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             image_number: String(i + 1),
           };
 
-          // Generate SEO alt text
           let altText = media.image.altText || product.title || "";
           let fileName = `optimized-${media.id.split("/").pop()}`;
 
@@ -290,18 +290,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             }
           }
 
-          // Download the original image
           const imageResponse = await fetch(media.image.url);
           const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
           const originalSize = imageBuffer.length;
 
-          // Convert to WebP
-          const webpBuffer = await sharp(imageBuffer)
-            .webp({ quality: 85 })
-            .toBuffer();
+          const webpBuffer = await sharp(imageBuffer).webp({ quality: 85 }).toBuffer();
           const webpSize = webpBuffer.length;
 
-          // Step 1: Create a staged upload for the WebP file
           const stagedUploadResponse = await admin.graphql(
             `#graphql
               mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
@@ -332,7 +327,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                   },
                 ],
               },
-            }
+            },
           );
 
           const stagedData = await stagedUploadResponse.json();
@@ -342,7 +337,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             throw new Error("Failed to create staged upload");
           }
 
-          // Step 2: Upload the WebP file to the staged URL
           const uploadFormData = new FormData();
           for (const param of target.parameters) {
             uploadFormData.append(param.name, param.value);
@@ -350,7 +344,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           uploadFormData.append(
             "file",
             new Blob([webpBuffer], { type: "image/webp" }),
-            `${fileName}.webp`
+            `${fileName}.webp`,
           );
 
           const uploadResponse = await fetch(target.url, {
@@ -362,7 +356,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             throw new Error(`Upload failed: ${uploadResponse.statusText}`);
           }
 
-          // Step 3: Delete the old image from the product
           const deleteResponse = await admin.graphql(
             `#graphql
               mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
@@ -380,15 +373,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 productId,
                 mediaIds: [media.id],
               },
-            }
+            },
           );
 
           const deleteData = await deleteResponse.json();
           if (deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0) {
-            console.error("Delete errors:", deleteData.data.productDeleteMedia.mediaUserErrors);
+            console.error(
+              "Delete errors:",
+              deleteData.data.productDeleteMedia.mediaUserErrors,
+            );
           }
 
-          // Step 4: Add the WebP image to the product with SEO alt text
           const createMediaResponse = await admin.graphql(
             `#graphql
               mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
@@ -419,7 +414,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                   },
                 ],
               },
-            }
+            },
           );
 
           const createData = await createMediaResponse.json();
@@ -429,14 +424,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             throw new Error(
               createData.data.productCreateMedia.mediaUserErrors
                 .map((e: any) => e.message)
-                .join(", ")
+                .join(", "),
             );
           }
 
           const savings = originalSize - webpSize;
           totalSaved += savings;
 
-          // Update record with completion
           await db.imageOptimization.update({
             where: {
               shop_imageId: {
@@ -485,7 +479,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     return json({
       success: true,
-      actionType: "optimize",
+      actionType: actionType === "retry_single" ? "retry" : "optimize",
       processedCount,
       errorCount,
       skippedCount,
@@ -503,7 +497,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
-        // Delete the current WebP image
         if (opt.webpGid) {
           await admin.graphql(
             `#graphql
@@ -522,12 +515,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 productId: opt.productId,
                 mediaIds: [opt.webpGid],
               },
-            }
+            },
           );
         }
 
-        // Re-add the original image with original alt text
-        const createMediaResponse = await admin.graphql(
+        await admin.graphql(
           `#graphql
             mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
               productCreateMedia(media: $media, productId: $productId) {
@@ -557,17 +549,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 },
               ],
             },
-          }
+          },
         );
-
-        const createData = await createMediaResponse.json();
-        if (createData.data?.productCreateMedia?.mediaUserErrors?.length > 0) {
-          throw new Error(
-            createData.data.productCreateMedia.mediaUserErrors
-              .map((e: any) => e.message)
-              .join(", ")
-          );
-        }
 
         await db.imageOptimization.update({
           where: { id: opt.id },
@@ -598,7 +581,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
 
       if (!opt || opt.status !== "completed") {
-        return json({ success: false, message: "Optimization not found or not completed" });
+        return json({
+          success: false,
+          message: "Optimization not found or not completed",
+        });
       }
 
       if (opt.webpGid) {
@@ -619,7 +605,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               productId: opt.productId,
               mediaIds: [opt.webpGid],
             },
-          }
+          },
         );
       }
 
@@ -650,7 +636,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               },
             ],
           },
-        }
+        },
       );
 
       await db.imageOptimization.update({
@@ -669,13 +655,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function ImageOptimizer() {
-  const { shop, stats, recentOptimizations, products, totalImages, newImages, seoSettings } =
-    useLoaderData<typeof loader>();
+  const {
+    shop,
+    stats,
+    recentOptimizations,
+    products,
+    totalImages,
+    newImages,
+    seoSettings,
+  } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
 
   const [showRevertModal, setShowRevertModal] = useState(false);
+  const [compareImage, setCompareImage] = useState<any>(null);
 
   const isOptimizing =
     navigation.state === "submitting" &&
@@ -687,13 +681,16 @@ export default function ImageOptimizer() {
     navigation.state === "submitting" &&
     (navigation.formData?.get("action") === "revert_all" ||
       navigation.formData?.get("action") === "revert_single");
+  const isRetrying =
+    navigation.state === "submitting" &&
+    navigation.formData?.get("action") === "retry_single";
 
   const statsMap = stats.reduce(
     (acc: any, stat: any) => {
       acc[stat.status] = stat._count.status;
       return acc;
     },
-    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 }
+    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
   );
 
   const completionPercentage =
@@ -725,44 +722,22 @@ export default function ImageOptimizer() {
     submit(formData, { method: "post" });
   };
 
-  const tableRows = recentOptimizations.map((opt: any) => [
-    opt.imageId.split("/").pop(),
-    opt.productId.split("/").pop(),
-    <Badge
-      tone={
-        opt.status === "completed"
-          ? "success"
-          : opt.status === "failed"
-          ? "critical"
-          : opt.status === "reverted"
-          ? "warning"
-          : "info"
-      }
-      key={opt.id}
-    >
-      {opt.status}
-    </Badge>,
-    opt.fileSize ? `${(opt.fileSize / 1024).toFixed(1)} KB` : "-",
-    opt.webpFileSize ? `${(opt.webpFileSize / 1024).toFixed(1)} KB` : "-",
-    opt.webpFileSize && opt.fileSize
-      ? `${(((opt.fileSize - opt.webpFileSize) / opt.fileSize) * 100).toFixed(1)}%`
-      : "-",
-    opt.altTextUpdated ? (
-      <Badge tone="success" key={`seo-${opt.id}`}>SEO</Badge>
-    ) : "-",
-    opt.status === "completed" ? (
-      <Button
-        key={`revert-${opt.id}`}
-        size="slim"
-        onClick={() => handleRevertSingle(opt.id)}
-        loading={isReverting}
-      >
-        Revert
-      </Button>
-    ) : (
-      "-"
-    ),
-  ]);
+  const handleRetrySingle = (imageId: string) => {
+    const formData = new FormData();
+    formData.append("action", "retry_single");
+    formData.append("imageId", imageId);
+    submit(formData, { method: "post" });
+  };
+
+  const handleCompare = (opt: any) => {
+    setCompareImage(opt);
+  };
+
+  // Build a product lookup map for performance
+  const productMap: Record<string, string> = {};
+  for (const p of products) {
+    productMap[p.id] = p.title;
+  }
 
   return (
     <Page
@@ -779,10 +754,22 @@ export default function ImageOptimizer() {
                 title="Optimization Complete"
               >
                 <p>
-                  Processed: {actionData.processedCount} | Skipped: {actionData.skippedCount} |
-                  Errors: {actionData.errorCount}
+                  Processed: {actionData.processedCount} | Skipped:{" "}
+                  {actionData.skippedCount} | Errors: {actionData.errorCount}
                   {actionData.totalSaved > 0 &&
                     ` | Total saved: ${(actionData.totalSaved / 1024).toFixed(1)} KB`}
+                </p>
+              </Banner>
+            )}
+
+            {actionData?.actionType === "retry" && (
+              <Banner
+                tone={actionData.errorCount > 0 ? "warning" : "success"}
+                title="Retry Complete"
+              >
+                <p>
+                  Processed: {actionData.processedCount} | Errors:{" "}
+                  {actionData.errorCount}
                 </p>
               </Banner>
             )}
@@ -796,11 +783,11 @@ export default function ImageOptimizer() {
               </Banner>
             )}
 
-            {/* SEO status banner */}
             {seoSettings?.autoApplyOnOptimize && (
               <Banner tone="info">
                 <p>
-                  SEO alt text and filenames will be applied automatically during optimization.
+                  SEO alt text and filenames will be applied automatically during
+                  optimization.
                   <a href="/app/settings"> Edit templates</a>
                 </p>
               </Banner>
@@ -813,7 +800,8 @@ export default function ImageOptimizer() {
                   Sync Images
                 </Text>
                 <Text as="p" tone="subdued">
-                  If you uploaded new product images, click refresh to detect them.
+                  If you uploaded new product images, click refresh to detect
+                  them.
                 </Text>
                 <div>
                   <Button onClick={handleRefresh} loading={isRefreshing}>
@@ -823,11 +811,11 @@ export default function ImageOptimizer() {
               </BlockStack>
             </Card>
 
-            {/* New images banner */}
             {newImages > 0 && (
               <Banner tone="info">
                 <p>
-                  Found {newImages} new image{newImages !== 1 ? "s" : ""} ready to optimize.
+                  Found {newImages} new image{newImages !== 1 ? "s" : ""} ready
+                  to optimize.
                 </p>
               </Banner>
             )}
@@ -842,8 +830,8 @@ export default function ImageOptimizer() {
                 <BlockStack gap="200">
                   <Text as="p">Total images: {totalImages}</Text>
                   <Text as="p">
-                    Optimized: {statsMap.completed} | Failed: {statsMap.failed} | Reverted:{" "}
-                    {statsMap.reverted || 0}
+                    Optimized: {statsMap.completed} | Failed: {statsMap.failed} |
+                    Reverted: {statsMap.reverted || 0}
                   </Text>
                 </BlockStack>
                 <InlineStack gap="300">
@@ -871,36 +859,212 @@ export default function ImageOptimizer() {
               </BlockStack>
             </Card>
 
-            {/* Recent optimizations table */}
+            {/* Recent optimizations with thumbnails */}
             <Card>
               <BlockStack gap="400">
                 <Text as="h2" variant="headingMd">
                   Recent Optimizations
                 </Text>
-                {tableRows.length > 0 ? (
-                  <DataTable
-                    columnContentTypes={[
-                      "text",
-                      "text",
-                      "text",
-                      "text",
-                      "text",
-                      "text",
-                      "text",
-                      "text",
-                    ]}
-                    headings={[
-                      "Image ID",
-                      "Product ID",
-                      "Status",
-                      "Original",
-                      "WebP",
-                      "Savings",
-                      "SEO",
-                      "Action",
-                    ]}
-                    rows={tableRows}
-                  />
+                {recentOptimizations.length > 0 ? (
+                  <div style={{ overflowX: "auto" }}>
+                    <table
+                      style={{
+                        width: "100%",
+                        borderCollapse: "collapse",
+                        fontSize: "14px",
+                      }}
+                    >
+                      <thead>
+                        <tr
+                          style={{
+                            borderBottom: "1px solid #e1e3e5",
+                            textAlign: "left",
+                          }}
+                        >
+                          <th style={{ padding: "12px 8px" }}>Preview</th>
+                          <th style={{ padding: "12px 8px" }}>Product</th>
+                          <th style={{ padding: "12px 8px" }}>Status</th>
+                          <th style={{ padding: "12px 8px" }}>Original</th>
+                          <th style={{ padding: "12px 8px" }}>WebP</th>
+                          <th style={{ padding: "12px 8px" }}>Savings</th>
+                          <th style={{ padding: "12px 8px" }}>SEO</th>
+                          <th style={{ padding: "12px 8px" }}>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {recentOptimizations.map((opt: any) => {
+                          const thumbUrl = opt.webpUrl || opt.originalUrl;
+                          const productName =
+                            productMap[opt.productId] ||
+                            opt.productId.split("/").pop();
+
+                          return (
+                            <tr
+                              key={opt.id}
+                              style={{
+                                borderBottom: "1px solid #f1f2f3",
+                              }}
+                            >
+                              {/* Thumbnail */}
+                              <td style={{ padding: "8px" }}>
+                                {thumbUrl ? (
+                                  <div
+                                    onClick={() =>
+                                      opt.status === "completed" &&
+                                      handleCompare(opt)
+                                    }
+                                    style={{
+                                      cursor:
+                                        opt.status === "completed"
+                                          ? "pointer"
+                                          : "default",
+                                    }}
+                                    title={
+                                      opt.status === "completed"
+                                        ? "Click to compare original vs WebP"
+                                        : ""
+                                    }
+                                  >
+                                    <Thumbnail
+                                      source={thumbUrl}
+                                      alt={`Image ${opt.imageId.split("/").pop()}`}
+                                      size="small"
+                                    />
+                                  </div>
+                                ) : (
+                                  <div
+                                    style={{
+                                      width: 40,
+                                      height: 40,
+                                      backgroundColor: "#f1f2f3",
+                                      borderRadius: 4,
+                                      display: "flex",
+                                      alignItems: "center",
+                                      justifyContent: "center",
+                                      fontSize: "10px",
+                                      color: "#8c9196",
+                                    }}
+                                  >
+                                    N/A
+                                  </div>
+                                )}
+                              </td>
+
+                              {/* Product name */}
+                              <td style={{ padding: "8px" }}>
+                                <Text
+                                  as="span"
+                                  variant="bodyMd"
+                                  fontWeight="semibold"
+                                >
+                                  {productName}
+                                </Text>
+                              </td>
+
+                              {/* Status badge */}
+                              <td style={{ padding: "8px" }}>
+                                <Badge
+                                  tone={
+                                    opt.status === "completed"
+                                      ? "success"
+                                      : opt.status === "failed"
+                                        ? "critical"
+                                        : opt.status === "reverted"
+                                          ? "warning"
+                                          : "info"
+                                  }
+                                >
+                                  {opt.status}
+                                </Badge>
+                              </td>
+
+                              {/* Original size */}
+                              <td style={{ padding: "8px" }}>
+                                {opt.fileSize
+                                  ? `${(opt.fileSize / 1024).toFixed(1)} KB`
+                                  : "-"}
+                              </td>
+
+                              {/* WebP size */}
+                              <td style={{ padding: "8px" }}>
+                                {opt.webpFileSize
+                                  ? `${(opt.webpFileSize / 1024).toFixed(1)} KB`
+                                  : "-"}
+                              </td>
+
+                              {/* Savings */}
+                              <td style={{ padding: "8px" }}>
+                                {opt.webpFileSize && opt.fileSize ? (
+                                  <span
+                                    style={{
+                                      color: "#008060",
+                                      fontWeight: 600,
+                                    }}
+                                  >
+                                    {(
+                                      ((opt.fileSize - opt.webpFileSize) /
+                                        opt.fileSize) *
+                                      100
+                                    ).toFixed(1)}
+                                    %
+                                  </span>
+                                ) : (
+                                  "-"
+                                )}
+                              </td>
+
+                              {/* SEO */}
+                              <td style={{ padding: "8px" }}>
+                                {opt.altTextUpdated ? (
+                                  <Badge tone="success">SEO</Badge>
+                                ) : (
+                                  "-"
+                                )}
+                              </td>
+
+                              {/* Actions */}
+                              <td style={{ padding: "8px" }}>
+                                <InlineStack gap="200">
+                                  {opt.status === "completed" && (
+                                    <>
+                                      <Button
+                                        size="slim"
+                                        onClick={() => handleCompare(opt)}
+                                      >
+                                        Compare
+                                      </Button>
+                                      <Button
+                                        size="slim"
+                                        tone="critical"
+                                        onClick={() =>
+                                          handleRevertSingle(opt.id)
+                                        }
+                                        loading={isReverting}
+                                      >
+                                        Revert
+                                      </Button>
+                                    </>
+                                  )}
+                                  {opt.status === "failed" && (
+                                    <Button
+                                      size="slim"
+                                      variant="primary"
+                                      onClick={() =>
+                                        handleRetrySingle(opt.imageId)
+                                      }
+                                      loading={isRetrying}
+                                    >
+                                      Retry
+                                    </Button>
+                                  )}
+                                </InlineStack>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 ) : (
                   <Text as="p" tone="subdued">
                     No optimizations yet. Click Refresh, then Optimize to start.
@@ -932,9 +1096,106 @@ export default function ImageOptimizer() {
         >
           <Modal.Section>
             <Text as="p">
-              This will restore all {statsMap.completed} optimized images back to their originals,
-              including reverting alt text. Your WebP versions will be removed from the products.
+              This will restore all {statsMap.completed} optimized images back to
+              their originals, including reverting alt text. Your WebP versions
+              will be removed from the products.
             </Text>
+          </Modal.Section>
+        </Modal>
+      )}
+
+      {/* Compare modal - Original vs WebP side by side */}
+      {compareImage && (
+        <Modal
+          open={!!compareImage}
+          onClose={() => setCompareImage(null)}
+          title="Compare: Original vs WebP"
+          large
+          secondaryActions={[
+            {
+              content: "Close",
+              onAction: () => setCompareImage(null),
+            },
+          ]}
+        >
+          <Modal.Section>
+            <div
+              style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}
+            >
+              {/* Original */}
+              <div style={{ flex: 1, minWidth: "250px" }}>
+                <BlockStack gap="300">
+                  <InlineStack align="center" gap="200">
+                    <Badge tone="warning">Original</Badge>
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      {compareImage.fileSize
+                        ? `${(compareImage.fileSize / 1024).toFixed(1)} KB`
+                        : ""}
+                    </Text>
+                  </InlineStack>
+                  <div
+                    style={{
+                      border: "1px solid #e1e3e5",
+                      borderRadius: "8px",
+                      overflow: "hidden",
+                      backgroundColor: "#fafafa",
+                    }}
+                  >
+                    <img
+                      src={compareImage.originalUrl}
+                      alt="Original"
+                      style={{
+                        width: "100%",
+                        height: "auto",
+                        display: "block",
+                      }}
+                    />
+                  </div>
+                </BlockStack>
+              </div>
+
+              {/* WebP */}
+              <div style={{ flex: 1, minWidth: "250px" }}>
+                <BlockStack gap="300">
+                  <InlineStack align="center" gap="200">
+                    <Badge tone="success">WebP (Optimized)</Badge>
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      {compareImage.webpFileSize
+                        ? `${(compareImage.webpFileSize / 1024).toFixed(1)} KB`
+                        : ""}
+                    </Text>
+                    {compareImage.fileSize && compareImage.webpFileSize && (
+                      <Text as="span" variant="bodySm" tone="success">
+                        {(
+                          ((compareImage.fileSize - compareImage.webpFileSize) /
+                            compareImage.fileSize) *
+                          100
+                        ).toFixed(1)}
+                        % smaller
+                      </Text>
+                    )}
+                  </InlineStack>
+                  <div
+                    style={{
+                      border: "1px solid #e1e3e5",
+                      borderRadius: "8px",
+                      overflow: "hidden",
+                      backgroundColor: "#fafafa",
+                    }}
+                  >
+                    <img
+                      src={compareImage.webpUrl}
+                      alt="WebP Optimized"
+                      style={{
+                        width: "100%",
+                        height: "auto",
+                        display: "block",
+                      }}
+                    />
+                  </div>
+                </BlockStack>
+              </div>
+            </div>
           </Modal.Section>
         </Modal>
       )}
