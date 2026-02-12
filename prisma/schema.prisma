@@ -39,8 +39,10 @@ model ImageOptimization {
   productId       String
   imageId         String
   originalUrl     String
+  originalGid     String?  // Original Shopify media GID for revert
   webpUrl         String?
-  status          String   @default("pending") // pending, processing, completed, failed
+  webpGid         String?  // New Shopify media GID after replacement
+  status          String   @default("pending") // pending, processing, completed, failed, reverted
   fileSize        Int?
   webpFileSize    Int?
   createdAt       DateTime @default(now())
