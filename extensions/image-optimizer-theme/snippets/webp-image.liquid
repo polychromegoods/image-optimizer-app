@@ -1,0 +1,29 @@
+{% comment %}
+  WebP Image Optimizer Snippet
+  
+  Usage:
+  {% render 'webp-image', image: product.featured_image, alt: product.title %}
+  
+  This snippet will serve WebP images when available, with fallback to original images.
+{% endcomment %}
+
+{% assign image_id = image.id | split: '/' | last %}
+{% assign webp_url = nil %}
+
+{% comment %}
+  In production, you would fetch the WebP URL from your app's API
+  For now, this serves as a template for the implementation
+{% endcomment %}
+
+<picture>
+  {% if webp_url %}
+    <source srcset="{{ webp_url }}" type="image/webp">
+  {% endif %}
+  <img 
+    src="{{ image | image_url: width: image.width }}" 
+    alt="{{ alt | escape }}"
+    width="{{ image.width }}"
+    height="{{ image.height }}"
+    loading="lazy"
+  >
+</picture>
