@@ -21,6 +21,29 @@ import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import sharp from "sharp";
 
+function applyTemplate(
+  template: string,
+  variables: Record<string, string>
+): string {
+  let result = template;
+  for (const [key, value] of Object.entries(variables)) {
+    result = result.replace(new RegExp(`#${key}#`, "g"), value);
+  }
+  result = result.replace(/\s+/g, " ").trim();
+  result = result.replace(/[-_|,]\s*$/, "").trim();
+  return result;
+}
+
+function makeFileName(template: string, variables: Record<string, string>): string {
+  let result = applyTemplate(template, variables);
+  return result
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
@@ -40,7 +63,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     take: 20,
   });
 
-  // Fetch products with images using media query
+  // Fetch products with images
   const response = await admin.graphql(
     `#graphql
       query getProducts($first: Int!) {
@@ -49,6 +72,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             node {
               id
               title
+              handle
+              vendor
+              productType
               media(first: 50) {
                 edges {
                   node {
@@ -103,9 +129,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  // Count reverted images
-  const revertedCount = await db.imageOptimization.count({
-    where: { shop, status: "completed" },
+  // Get SEO settings
+  const seoSettings = await db.seoSettings.findUnique({
+    where: { shop },
   });
 
   return json({
@@ -115,7 +141,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     products,
     totalImages,
     newImages,
-    revertedCount,
+    seoSettings,
   });
 };
 
@@ -130,6 +156,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (actionType === "optimize_new") {
+    // Get SEO settings
+    const seoSettings = await db.seoSettings.findUnique({
+      where: { shop },
+    });
+
+    // Get shop name
+    const shopResponse = await admin.graphql(
+      `#graphql
+        query {
+          shop {
+            name
+          }
+        }
+      `
+    );
+    const shopData = await shopResponse.json();
+    const shopName = shopData.data?.shop?.name || shop;
+
     // Get all products with media
     const response = await admin.graphql(
       `#graphql
@@ -139,6 +183,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               node {
                 id
                 title
+                handle
+                vendor
+                productType
                 media(first: 50) {
                   edges {
                     node {
@@ -177,7 +224,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         ?.map((e: any) => e.node)
         ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
 
-      for (const media of mediaImages) {
+      for (let i = 0; i < mediaImages.length; i++) {
+        const media = mediaImages[i];
+
         try {
           // Check if already optimized
           const existing = await db.imageOptimization.findUnique({
@@ -208,12 +257,38 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               imageId: media.id,
               originalUrl: media.image.url,
               originalGid: media.id,
+              originalAlt: media.image.altText || "",
               status: "processing",
             },
             update: {
               status: "processing",
+              originalAlt: media.image.altText || "",
             },
           });
+
+          // Build template variables
+          const templateVars = {
+            product_name: product.title || "",
+            vendor: product.vendor || "",
+            product_type: product.productType || "",
+            shop_name: shopName,
+            product_handle: product.handle || "",
+            variant_title: "",
+            image_number: String(i + 1),
+          };
+
+          // Generate SEO alt text
+          let altText = media.image.altText || product.title || "";
+          let fileName = `optimized-${media.id.split("/").pop()}`;
+
+          if (seoSettings && seoSettings.autoApplyOnOptimize) {
+            if (seoSettings.altTextTemplate) {
+              altText = applyTemplate(seoSettings.altTextTemplate, templateVars);
+            }
+            if (seoSettings.fileNameTemplate) {
+              fileName = makeFileName(seoSettings.fileNameTemplate, templateVars);
+            }
+          }
 
           // Download the original image
           const imageResponse = await fetch(media.image.url);
@@ -251,7 +326,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 input: [
                   {
                     resource: "IMAGE",
-                    filename: `optimized-${media.id.split("/").pop()}.webp`,
+                    filename: `${fileName}.webp`,
                     mimeType: "image/webp",
                     httpMethod: "POST",
                   },
@@ -275,7 +350,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           uploadFormData.append(
             "file",
             new Blob([webpBuffer], { type: "image/webp" }),
-            `optimized-${media.id.split("/").pop()}.webp`
+            `${fileName}.webp`
           );
 
           const uploadResponse = await fetch(target.url, {
@@ -313,7 +388,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             console.error("Delete errors:", deleteData.data.productDeleteMedia.mediaUserErrors);
           }
 
-          // Step 4: Add the WebP image to the product
+          // Step 4: Add the WebP image to the product with SEO alt text
           const createMediaResponse = await admin.graphql(
             `#graphql
               mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
@@ -338,7 +413,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 productId,
                 media: [
                   {
-                    alt: media.image.altText || "Optimized WebP image",
+                    alt: altText,
                     mediaContentType: "IMAGE",
                     originalSource: target.resourceUrl,
                   },
@@ -375,6 +450,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               fileSize: originalSize,
               webpFileSize: webpSize,
               status: "completed",
+              altTextUpdated: seoSettings?.autoApplyOnOptimize ? true : false,
             },
           });
 
@@ -396,6 +472,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               imageId: media.id,
               originalUrl: media.image?.url || "",
               originalGid: media.id,
+              originalAlt: media.image?.altText || "",
               status: "failed",
             },
             update: {
@@ -417,7 +494,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (actionType === "revert_all") {
-    // Get all completed optimizations for this shop
     const optimizations = await db.imageOptimization.findMany({
       where: { shop, status: "completed" },
     });
@@ -427,7 +503,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
-        // Step 1: Delete the current WebP image from the product
+        // Delete the current WebP image
         if (opt.webpGid) {
           await admin.graphql(
             `#graphql
@@ -450,7 +526,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
         }
 
-        // Step 2: Re-add the original image from the saved URL
+        // Re-add the original image with original alt text
         const createMediaResponse = await admin.graphql(
           `#graphql
             mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
@@ -475,7 +551,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               productId: opt.productId,
               media: [
                 {
-                  alt: "Restored original image",
+                  alt: opt.originalAlt || "Restored original image",
                   mediaContentType: "IMAGE",
                   originalSource: opt.originalUrl,
                 },
@@ -493,10 +569,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
         }
 
-        // Update record as reverted
         await db.imageOptimization.update({
           where: { id: opt.id },
-          data: { status: "reverted" },
+          data: { status: "reverted", altTextUpdated: false },
         });
 
         revertedCount++;
@@ -526,7 +601,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return json({ success: false, message: "Optimization not found or not completed" });
       }
 
-      // Delete the WebP image
       if (opt.webpGid) {
         await admin.graphql(
           `#graphql
@@ -549,7 +623,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         );
       }
 
-      // Re-add original
       await admin.graphql(
         `#graphql
           mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
@@ -571,7 +644,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             productId: opt.productId,
             media: [
               {
-                alt: "Restored original image",
+                alt: opt.originalAlt || "Restored original image",
                 mediaContentType: "IMAGE",
                 originalSource: opt.originalUrl,
               },
@@ -582,7 +655,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       await db.imageOptimization.update({
         where: { id: opt.id },
-        data: { status: "reverted" },
+        data: { status: "reverted", altTextUpdated: false },
       });
 
       return json({ success: true, actionType: "revert_single" });
@@ -596,7 +669,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function ImageOptimizer() {
-  const { shop, stats, recentOptimizations, products, totalImages, newImages, revertedCount } =
+  const { shop, stats, recentOptimizations, products, totalImages, newImages, seoSettings } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
@@ -674,6 +747,9 @@ export default function ImageOptimizer() {
     opt.webpFileSize && opt.fileSize
       ? `${(((opt.fileSize - opt.webpFileSize) / opt.fileSize) * 100).toFixed(1)}%`
       : "-",
+    opt.altTextUpdated ? (
+      <Badge tone="success" key={`seo-${opt.id}`}>SEO</Badge>
+    ) : "-",
     opt.status === "completed" ? (
       <Button
         key={`revert-${opt.id}`}
@@ -716,6 +792,16 @@ export default function ImageOptimizer() {
                 <p>
                   Reverted {actionData.revertedCount} image
                   {actionData.revertedCount !== 1 ? "s" : ""} back to originals.
+                </p>
+              </Banner>
+            )}
+
+            {/* SEO status banner */}
+            {seoSettings?.autoApplyOnOptimize && (
+              <Banner tone="info">
+                <p>
+                  SEO alt text and filenames will be applied automatically during optimization.
+                  <a href="/app/settings"> Edit templates</a>
                 </p>
               </Banner>
             )}
@@ -801,6 +887,7 @@ export default function ImageOptimizer() {
                       "text",
                       "text",
                       "text",
+                      "text",
                     ]}
                     headings={[
                       "Image ID",
@@ -809,6 +896,7 @@ export default function ImageOptimizer() {
                       "Original",
                       "WebP",
                       "Savings",
+                      "SEO",
                       "Action",
                     ]}
                     rows={tableRows}
@@ -844,8 +932,8 @@ export default function ImageOptimizer() {
         >
           <Modal.Section>
             <Text as="p">
-              This will restore all {statsMap.completed} optimized images back to their originals.
-              Your WebP versions will be removed from the products.
+              This will restore all {statsMap.completed} optimized images back to their originals,
+              including reverting alt text. Your WebP versions will be removed from the products.
             </Text>
           </Modal.Section>
         </Modal>

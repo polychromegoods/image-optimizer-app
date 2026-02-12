@@ -25,7 +25,7 @@ export default function App() {
           Home
         </Link>
         <Link to="/app/image-optimizer">Image Optimizer</Link>
-        <Link to="/app/settings">Settings</Link>
+        <Link to="/app/settings">SEO Settings</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>

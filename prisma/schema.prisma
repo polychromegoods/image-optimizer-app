@@ -39,15 +39,27 @@ model ImageOptimization {
   productId       String
   imageId         String
   originalUrl     String
-  originalGid     String?  // Original Shopify media GID for revert
+  originalGid     String?
+  originalAlt     String?  // Original alt text before SEO rename
   webpUrl         String?
-  webpGid         String?  // New Shopify media GID after replacement
-  status          String   @default("pending") // pending, processing, completed, failed, reverted
+  webpGid         String?
+  status          String   @default("pending")
   fileSize        Int?
   webpFileSize    Int?
+  altTextUpdated  Boolean  @default(false)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   @@unique([shop, imageId])
   @@index([shop, status])
+}
+
+model SeoSettings {
+  id                String   @id @default(uuid())
+  shop              String   @unique
+  altTextTemplate   String   @default("#product_name#")
+  fileNameTemplate  String   @default("#product_name#")
+  autoApplyOnOptimize Boolean @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 }
