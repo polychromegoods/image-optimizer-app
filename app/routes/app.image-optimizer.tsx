@@ -34,7 +34,10 @@ function applyTemplate(
   return result;
 }
 
-function makeFileName(template: string, variables: Record<string, string>): string {
+function makeFileName(
+  template: string,
+  variables: Record<string, string>,
+): string {
   let result = applyTemplate(template, variables);
   return result
     .toLowerCase()
@@ -42,6 +45,191 @@ function makeFileName(template: string, variables: Record<string, string>): stri
     .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+// Helper: Upload a buffer to Shopify Files via staged upload and return the permanent file URL
+async function uploadToShopifyFiles(
+  admin: any,
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+): Promise<string> {
+  // Step 1: Create staged upload for FILE resource (permanent Shopify Files storage)
+  const stagedUploadResponse = await admin.graphql(
+    `#graphql
+      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets {
+            url
+            resourceUrl
+            parameters {
+              name
+              value
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      variables: {
+        input: [
+          {
+            resource: "FILE",
+            filename,
+            mimeType,
+            httpMethod: "POST",
+          },
+        ],
+      },
+    },
+  );
+
+  const stagedData = await stagedUploadResponse.json();
+  const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
+
+  if (!target) {
+    throw new Error("Failed to create staged upload for backup");
+  }
+
+  // Step 2: Upload the file
+  const uploadFormData = new FormData();
+  for (const param of target.parameters) {
+    uploadFormData.append(param.name, param.value);
+  }
+  uploadFormData.append(
+    "file",
+    new Blob([buffer], { type: mimeType }),
+    filename,
+  );
+
+  const uploadResponse = await fetch(target.url, {
+    method: "POST",
+    body: uploadFormData,
+  });
+
+  if (!uploadResponse.ok) {
+    throw new Error(`Backup upload failed: ${uploadResponse.statusText}`);
+  }
+
+  // Step 3: Create the file in Shopify Files so it persists permanently
+  const fileCreateResponse = await admin.graphql(
+    `#graphql
+      mutation fileCreate($files: [FileCreateInput!]!) {
+        fileCreate(files: $files) {
+          files {
+            ... on GenericFile {
+              id
+              url
+            }
+            ... on MediaImage {
+              id
+              image {
+                url
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      variables: {
+        files: [
+          {
+            alt: "Backup original image",
+            contentType: "IMAGE",
+            originalSource: target.resourceUrl,
+          },
+        ],
+      },
+    },
+  );
+
+  const fileData = await fileCreateResponse.json();
+  const createdFile = fileData.data?.fileCreate?.files?.[0];
+
+  if (fileData.data?.fileCreate?.userErrors?.length > 0) {
+    console.error("File create errors:", fileData.data.fileCreate.userErrors);
+  }
+
+  // The resourceUrl from staged upload is the permanent URL we can use
+  // The file might take a moment to process, but resourceUrl is immediately usable
+  return target.resourceUrl;
+}
+
+// Helper: Upload WebP to Shopify via staged upload for product media
+async function uploadWebpForProduct(
+  admin: any,
+  webpBuffer: Buffer,
+  fileName: string,
+): Promise<{ url: string; resourceUrl: string }> {
+  const stagedUploadResponse = await admin.graphql(
+    `#graphql
+      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets {
+            url
+            resourceUrl
+            parameters {
+              name
+              value
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      variables: {
+        input: [
+          {
+            resource: "IMAGE",
+            filename: `${fileName}.webp`,
+            mimeType: "image/webp",
+            httpMethod: "POST",
+          },
+        ],
+      },
+    },
+  );
+
+  const stagedData = await stagedUploadResponse.json();
+  const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
+
+  if (!target) {
+    throw new Error("Failed to create staged upload for WebP");
+  }
+
+  const uploadFormData = new FormData();
+  for (const param of target.parameters) {
+    uploadFormData.append(param.name, param.value);
+  }
+  uploadFormData.append(
+    "file",
+    new Blob([webpBuffer], { type: "image/webp" }),
+    `${fileName}.webp`,
+  );
+
+  const uploadResponse = await fetch(target.url, {
+    method: "POST",
+    body: uploadFormData,
+  });
+
+  if (!uploadResponse.ok) {
+    throw new Error(`WebP upload failed: ${uploadResponse.statusText}`);
+  }
+
+  return { url: target.url, resourceUrl: target.resourceUrl };
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -131,6 +319,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     where: { shop },
   });
 
+  // Count how many reverted records have a backupUrl (for recovery button)
+  const revertedWithBackup = await db.imageOptimization.count({
+    where: { shop, status: "reverted", backupUrl: { not: null } },
+  });
+
   return json({
     shop,
     stats,
@@ -139,6 +332,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     totalImages,
     newImages,
     seoSettings,
+    revertedWithBackup,
   });
 };
 
@@ -152,6 +346,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ success: true, message: "Refreshed" });
   }
 
+  // ===== OPTIMIZE NEW or RETRY SINGLE =====
   if (actionType === "optimize_new" || actionType === "retry_single") {
     const seoSettings = await db.seoSettings.findUnique({
       where: { shop },
@@ -241,7 +436,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             },
           });
 
-          if (actionType === "optimize_new" && existing && existing.status === "completed") {
+          if (
+            actionType === "optimize_new" &&
+            existing &&
+            existing.status === "completed"
+          ) {
             skippedCount++;
             continue;
           }
@@ -283,79 +482,66 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
           if (seoSettings && seoSettings.autoApplyOnOptimize) {
             if (seoSettings.altTextTemplate) {
-              altText = applyTemplate(seoSettings.altTextTemplate, templateVars);
+              altText = applyTemplate(
+                seoSettings.altTextTemplate,
+                templateVars,
+              );
             }
             if (seoSettings.fileNameTemplate) {
-              fileName = makeFileName(seoSettings.fileNameTemplate, templateVars);
+              fileName = makeFileName(
+                seoSettings.fileNameTemplate,
+                templateVars,
+              );
             }
           }
 
+          // Step 1: Fetch the original image
           const imageResponse = await fetch(media.image.url);
           const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
           const originalSize = imageBuffer.length;
 
-          const webpBuffer = await sharp(imageBuffer).webp({ quality: 85 }).toBuffer();
+          // Step 2: BACKUP - Upload original to Shopify Files for permanent storage
+          const originalExtension = media.image.url
+            .split("?")[0]
+            .split(".")
+            .pop() || "png";
+          const backupFilename = `backup-${media.id.split("/").pop()}.${originalExtension}`;
+          const backupMimeType =
+            originalExtension === "jpg" || originalExtension === "jpeg"
+              ? "image/jpeg"
+              : originalExtension === "webp"
+                ? "image/webp"
+                : "image/png";
+
+          let backupUrl: string;
+          try {
+            backupUrl = await uploadToShopifyFiles(
+              admin,
+              imageBuffer,
+              backupFilename,
+              backupMimeType,
+            );
+          } catch (backupError) {
+            console.error("Backup upload failed, skipping image:", backupError);
+            throw new Error(
+              `Backup failed for image ${media.id}: ${backupError}`,
+            );
+          }
+
+          // Step 3: Convert to WebP
+          const webpBuffer = await sharp(imageBuffer)
+            .webp({ quality: 85 })
+            .toBuffer();
           const webpSize = webpBuffer.length;
 
-          const stagedUploadResponse = await admin.graphql(
-            `#graphql
-              mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-                stagedUploadsCreate(input: $input) {
-                  stagedTargets {
-                    url
-                    resourceUrl
-                    parameters {
-                      name
-                      value
-                    }
-                  }
-                  userErrors {
-                    field
-                    message
-                  }
-                }
-              }
-            `,
-            {
-              variables: {
-                input: [
-                  {
-                    resource: "IMAGE",
-                    filename: `${fileName}.webp`,
-                    mimeType: "image/webp",
-                    httpMethod: "POST",
-                  },
-                ],
-              },
-            },
+          // Step 4: Upload WebP for product media
+          const { resourceUrl: webpResourceUrl } = await uploadWebpForProduct(
+            admin,
+            webpBuffer,
+            fileName,
           );
 
-          const stagedData = await stagedUploadResponse.json();
-          const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
-
-          if (!target) {
-            throw new Error("Failed to create staged upload");
-          }
-
-          const uploadFormData = new FormData();
-          for (const param of target.parameters) {
-            uploadFormData.append(param.name, param.value);
-          }
-          uploadFormData.append(
-            "file",
-            new Blob([webpBuffer], { type: "image/webp" }),
-            `${fileName}.webp`,
-          );
-
-          const uploadResponse = await fetch(target.url, {
-            method: "POST",
-            body: uploadFormData,
-          });
-
-          if (!uploadResponse.ok) {
-            throw new Error(`Upload failed: ${uploadResponse.statusText}`);
-          }
-
+          // Step 5: Delete original product media
           const deleteResponse = await admin.graphql(
             `#graphql
               mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
@@ -377,13 +563,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
 
           const deleteData = await deleteResponse.json();
-          if (deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0) {
+          if (
+            deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0
+          ) {
             console.error(
               "Delete errors:",
               deleteData.data.productDeleteMedia.mediaUserErrors,
             );
           }
 
+          // Step 6: Create new product media with WebP
           const createMediaResponse = await admin.graphql(
             `#graphql
               mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
@@ -410,7 +599,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                   {
                     alt: altText,
                     mediaContentType: "IMAGE",
-                    originalSource: target.resourceUrl,
+                    originalSource: webpResourceUrl,
                   },
                 ],
               },
@@ -420,7 +609,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const createData = await createMediaResponse.json();
           const newMedia = createData.data?.productCreateMedia?.media?.[0];
 
-          if (createData.data?.productCreateMedia?.mediaUserErrors?.length > 0) {
+          if (
+            createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
+          ) {
             throw new Error(
               createData.data.productCreateMedia.mediaUserErrors
                 .map((e: any) => e.message)
@@ -431,6 +622,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const savings = originalSize - webpSize;
           totalSaved += savings;
 
+          // Step 7: Save record with backupUrl for safe revert
           await db.imageOptimization.update({
             where: {
               shop_imageId: {
@@ -439,8 +631,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               },
             },
             data: {
-              webpUrl: newMedia?.image?.url || target.resourceUrl,
+              webpUrl: newMedia?.image?.url || webpResourceUrl,
               webpGid: newMedia?.id || null,
+              backupUrl: backupUrl,
               fileSize: originalSize,
               webpFileSize: webpSize,
               status: "completed",
@@ -487,6 +680,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
+  // ===== REVERT ALL =====
   if (actionType === "revert_all") {
     const optimizations = await db.imageOptimization.findMany({
       where: { shop, status: "completed" },
@@ -497,8 +691,40 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
+        // Use backupUrl (permanent Shopify Files URL) instead of originalUrl
+        const restoreSource = opt.backupUrl || opt.originalUrl;
+
+        // First verify the restore source is accessible
+        try {
+          const checkResponse = await fetch(restoreSource, { method: "HEAD" });
+          if (!checkResponse.ok) {
+            console.error(
+              `Restore source not accessible for ${opt.imageId}: ${checkResponse.status}`,
+            );
+            // Try the other URL as fallback
+            const fallbackUrl =
+              opt.backupUrl === restoreSource
+                ? opt.originalUrl
+                : opt.backupUrl;
+            if (fallbackUrl) {
+              const fallbackCheck = await fetch(fallbackUrl, {
+                method: "HEAD",
+              });
+              if (!fallbackCheck.ok) {
+                throw new Error("Neither backup nor original URL is accessible");
+              }
+            }
+          }
+        } catch (checkError) {
+          console.warn(
+            `URL check failed for ${opt.imageId}, attempting restore anyway:`,
+            checkError,
+          );
+        }
+
+        // Delete the WebP version from the product
         if (opt.webpGid) {
-          await admin.graphql(
+          const deleteResp = await admin.graphql(
             `#graphql
               mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
                 productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
@@ -517,9 +743,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               },
             },
           );
+          const deleteData = await deleteResp.json();
+          if (
+            deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0
+          ) {
+            console.error(
+              "Delete errors during revert:",
+              deleteData.data.productDeleteMedia.mediaUserErrors,
+            );
+          }
         }
 
-        await admin.graphql(
+        // Re-create product media from the backup/original
+        const createResp = await admin.graphql(
           `#graphql
             mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
               productCreateMedia(media: $media, productId: $productId) {
@@ -543,14 +779,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               productId: opt.productId,
               media: [
                 {
-                  alt: opt.originalAlt || "Restored original image",
+                  alt: opt.originalAlt || "",
                   mediaContentType: "IMAGE",
-                  originalSource: opt.originalUrl,
+                  originalSource: restoreSource,
                 },
               ],
             },
           },
         );
+
+        const createData = await createResp.json();
+        if (
+          createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
+        ) {
+          const errors = createData.data.productCreateMedia.mediaUserErrors
+            .map((e: any) => e.message)
+            .join(", ");
+          throw new Error(`Failed to create media: ${errors}`);
+        }
 
         await db.imageOptimization.update({
           where: { id: opt.id },
@@ -572,6 +818,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
+  // ===== REVERT SINGLE =====
   if (actionType === "revert_single") {
     const optimizationId = formData.get("optimizationId") as string;
 
@@ -586,6 +833,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           message: "Optimization not found or not completed",
         });
       }
+
+      const restoreSource = opt.backupUrl || opt.originalUrl;
 
       if (opt.webpGid) {
         await admin.graphql(
@@ -609,13 +858,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         );
       }
 
-      await admin.graphql(
+      const createResp = await admin.graphql(
         `#graphql
           mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
             productCreateMedia(media: $media, productId: $productId) {
               media {
                 ... on MediaImage {
                   id
+                  image {
+                    url
+                  }
                 }
               }
               mediaUserErrors {
@@ -630,14 +882,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             productId: opt.productId,
             media: [
               {
-                alt: opt.originalAlt || "Restored original image",
+                alt: opt.originalAlt || "",
                 mediaContentType: "IMAGE",
-                originalSource: opt.originalUrl,
+                originalSource: restoreSource,
               },
             ],
           },
         },
       );
+
+      const createData = await createResp.json();
+      if (createData.data?.productCreateMedia?.mediaUserErrors?.length > 0) {
+        const errors = createData.data.productCreateMedia.mediaUserErrors
+          .map((e: any) => e.message)
+          .join(", ");
+        throw new Error(`Failed to create media: ${errors}`);
+      }
 
       await db.imageOptimization.update({
         where: { id: opt.id },
@@ -649,6 +909,86 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       console.error("Error reverting single image:", error);
       return json({ success: false, message: "Failed to revert image" });
     }
+  }
+
+  // ===== RESTORE MISSING IMAGES =====
+  // This action finds all "reverted" records and tries to re-add images to products
+  // that are missing them, using backupUrl or originalUrl
+  if (actionType === "restore_missing") {
+    const revertedRecords = await db.imageOptimization.findMany({
+      where: { shop, status: "reverted" },
+    });
+
+    let restoredCount = 0;
+    let errorCount = 0;
+
+    for (const opt of revertedRecords) {
+      try {
+        // Try backupUrl first, then originalUrl
+        const restoreSource = opt.backupUrl || opt.originalUrl;
+
+        const createResp = await admin.graphql(
+          `#graphql
+            mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
+              productCreateMedia(media: $media, productId: $productId) {
+                media {
+                  ... on MediaImage {
+                    id
+                    image {
+                      url
+                    }
+                  }
+                }
+                mediaUserErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `,
+          {
+            variables: {
+              productId: opt.productId,
+              media: [
+                {
+                  alt: opt.originalAlt || "",
+                  mediaContentType: "IMAGE",
+                  originalSource: restoreSource,
+                },
+              ],
+            },
+          },
+        );
+
+        const createData = await createResp.json();
+        if (
+          createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
+        ) {
+          const errors = createData.data.productCreateMedia.mediaUserErrors
+            .map((e: any) => e.message)
+            .join(", ");
+          throw new Error(`Failed to restore: ${errors}`);
+        }
+
+        // Reset to pending so it can be re-optimized
+        await db.imageOptimization.update({
+          where: { id: opt.id },
+          data: { status: "restored" },
+        });
+
+        restoredCount++;
+      } catch (error) {
+        console.error(`Error restoring image ${opt.imageId}:`, error);
+        errorCount++;
+      }
+    }
+
+    return json({
+      success: true,
+      actionType: "restore",
+      restoredCount,
+      errorCount,
+    });
   }
 
   return json({ success: false });
@@ -663,12 +1003,14 @@ export default function ImageOptimizer() {
     totalImages,
     newImages,
     seoSettings,
+    revertedWithBackup,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
 
   const [showRevertModal, setShowRevertModal] = useState(false);
+  const [showRestoreModal, setShowRestoreModal] = useState(false);
   const [compareImage, setCompareImage] = useState<any>(null);
 
   const isOptimizing =
@@ -684,13 +1026,16 @@ export default function ImageOptimizer() {
   const isRetrying =
     navigation.state === "submitting" &&
     navigation.formData?.get("action") === "retry_single";
+  const isRestoring =
+    navigation.state === "submitting" &&
+    navigation.formData?.get("action") === "restore_missing";
 
   const statsMap = stats.reduce(
     (acc: any, stat: any) => {
       acc[stat.status] = stat._count.status;
       return acc;
     },
-    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
+    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0, restored: 0 },
   );
 
   const completionPercentage =
@@ -729,6 +1074,13 @@ export default function ImageOptimizer() {
     submit(formData, { method: "post" });
   };
 
+  const handleRestoreMissing = useCallback(() => {
+    const formData = new FormData();
+    formData.append("action", "restore_missing");
+    submit(formData, { method: "post" });
+    setShowRestoreModal(false);
+  }, [submit]);
+
   const handleCompare = (opt: any) => {
     setCompareImage(opt);
   };
@@ -742,7 +1094,7 @@ export default function ImageOptimizer() {
   return (
     <Page
       title="Image Optimizer"
-      subtitle="Compress product images to WebP for faster loading. Original images are saved and can be restored anytime."
+      subtitle="Compress product images to WebP for faster loading. Original images are backed up and can be restored anytime."
     >
       <Layout>
         <Layout.Section>
@@ -775,10 +1127,35 @@ export default function ImageOptimizer() {
             )}
 
             {actionData?.actionType === "revert" && (
-              <Banner tone="success" title="Revert Complete">
+              <Banner
+                tone={
+                  actionData.errorCount > 0
+                    ? actionData.revertedCount > 0
+                      ? "warning"
+                      : "critical"
+                    : "success"
+                }
+                title="Revert Complete"
+              >
                 <p>
                   Reverted {actionData.revertedCount} image
                   {actionData.revertedCount !== 1 ? "s" : ""} back to originals.
+                  {actionData.errorCount > 0 &&
+                    ` ${actionData.errorCount} error(s) occurred.`}
+                </p>
+              </Banner>
+            )}
+
+            {actionData?.actionType === "restore" && (
+              <Banner
+                tone={actionData.errorCount > 0 ? "warning" : "success"}
+                title="Restore Complete"
+              >
+                <p>
+                  Restored {actionData.restoredCount} image
+                  {actionData.restoredCount !== 1 ? "s" : ""}.
+                  {actionData.errorCount > 0 &&
+                    ` ${actionData.errorCount} error(s) occurred.`}
                 </p>
               </Banner>
             )}
@@ -855,6 +1232,14 @@ export default function ImageOptimizer() {
                       Revert All to Originals
                     </Button>
                   )}
+                  {(statsMap.reverted || 0) > 0 && (
+                    <Button
+                      onClick={() => setShowRestoreModal(true)}
+                      loading={isRestoring}
+                    >
+                      Restore Missing Images
+                    </Button>
+                  )}
                 </InlineStack>
               </BlockStack>
             </Card>
@@ -887,7 +1272,7 @@ export default function ImageOptimizer() {
                           <th style={{ padding: "12px 8px" }}>Original</th>
                           <th style={{ padding: "12px 8px" }}>WebP</th>
                           <th style={{ padding: "12px 8px" }}>Savings</th>
-                          <th style={{ padding: "12px 8px" }}>SEO</th>
+                          <th style={{ padding: "12px 8px" }}>Backup</th>
                           <th style={{ padding: "12px 8px" }}>Actions</th>
                         </tr>
                       </thead>
@@ -971,7 +1356,9 @@ export default function ImageOptimizer() {
                                         ? "critical"
                                         : opt.status === "reverted"
                                           ? "warning"
-                                          : "info"
+                                          : opt.status === "restored"
+                                            ? "info"
+                                            : "info"
                                   }
                                 >
                                   {opt.status}
@@ -1013,12 +1400,12 @@ export default function ImageOptimizer() {
                                 )}
                               </td>
 
-                              {/* SEO */}
+                              {/* Backup status */}
                               <td style={{ padding: "8px" }}>
-                                {opt.altTextUpdated ? (
-                                  <Badge tone="success">SEO</Badge>
+                                {opt.backupUrl ? (
+                                  <Badge tone="success">Backed up</Badge>
                                 ) : (
-                                  "-"
+                                  <Badge tone="warning">No backup</Badge>
                                 )}
                               </td>
 
@@ -1097,8 +1484,35 @@ export default function ImageOptimizer() {
           <Modal.Section>
             <Text as="p">
               This will restore all {statsMap.completed} optimized images back to
-              their originals, including reverting alt text. Your WebP versions
-              will be removed from the products.
+              their originals using the backed-up copies. Your WebP versions will
+              be removed from the products.
+            </Text>
+          </Modal.Section>
+        </Modal>
+      )}
+
+      {/* Restore missing images modal */}
+      {showRestoreModal && (
+        <Modal
+          open={showRestoreModal}
+          onClose={() => setShowRestoreModal(false)}
+          title="Restore Missing Images?"
+          primaryAction={{
+            content: "Restore Images",
+            onAction: handleRestoreMissing,
+          }}
+          secondaryActions={[
+            {
+              content: "Cancel",
+              onAction: () => setShowRestoreModal(false),
+            },
+          ]}
+        >
+          <Modal.Section>
+            <Text as="p">
+              This will attempt to restore {statsMap.reverted || 0} reverted
+              images back to their products using backup copies. Images that were
+              lost during a failed revert will be re-added.
             </Text>
           </Modal.Section>
         </Modal>
@@ -1142,7 +1556,7 @@ export default function ImageOptimizer() {
                     }}
                   >
                     <img
-                      src={compareImage.originalUrl}
+                      src={compareImage.backupUrl || compareImage.originalUrl}
                       alt="Original"
                       style={{
                         width: "100%",
@@ -1167,7 +1581,8 @@ export default function ImageOptimizer() {
                     {compareImage.fileSize && compareImage.webpFileSize && (
                       <Text as="span" variant="bodySm" tone="success">
                         {(
-                          ((compareImage.fileSize - compareImage.webpFileSize) /
+                          ((compareImage.fileSize -
+                            compareImage.webpFileSize) /
                             compareImage.fileSize) *
                           100
                         ).toFixed(1)}

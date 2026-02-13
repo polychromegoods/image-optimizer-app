@@ -41,6 +41,7 @@ model ImageOptimization {
   originalUrl     String
   originalGid     String?
   originalAlt     String?  // Original alt text before SEO rename
+  backupUrl       String?  // Permanent backup URL in Shopify Files for safe revert
   webpUrl         String?
   webpGid         String?
   status          String   @default("pending")
