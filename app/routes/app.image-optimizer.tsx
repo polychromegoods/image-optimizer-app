@@ -1244,48 +1244,45 @@ export default function ImageOptimizer() {
               </Banner>
             )}
 
-            {/* Optimize card */}
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Optimization Progress
-                </Text>
-                <ProgressBar progress={completionPercentage} size="small" />
-                <BlockStack gap="200">
-                  <Text as="p">Total images: {totalImages}</Text>
-                  <Text as="p">
-                    Optimized: {statsMap.completed} | Failed:{" "}
-                    {statsMap.failed} | Reverted: {statsMap.reverted || 0}
+            {/* Optimize card - hidden during active optimization to avoid duplicate progress bars */}
+            {!isOptimizing && (
+              <Card>
+                <BlockStack gap="400">
+                  <Text as="h2" variant="headingMd">
+                    Optimization Progress
                   </Text>
-                </BlockStack>
-                <InlineStack gap="300">
-                  <Button
-                    variant="primary"
-                    onClick={handleOptimizeNew}
-                    size="large"
-                    loading={
-                      isSubmitting && submittingAction === "optimize_new"
-                    }
-                    disabled={newImages === 0 || isOptimizing}
-                  >
-                    {isOptimizing
-                      ? "Optimizing..."
-                      : newImages > 0
+                  <ProgressBar progress={completionPercentage} size="small" />
+                  <BlockStack gap="200">
+                    <Text as="p">Total images: {totalImages}</Text>
+                    <Text as="p">
+                      Optimized: {statsMap.completed} | Failed:{" "}
+                      {statsMap.failed} | Reverted: {statsMap.reverted || 0}
+                    </Text>
+                  </BlockStack>
+                  <InlineStack gap="300">
+                    <Button
+                      variant="primary"
+                      onClick={handleOptimizeNew}
+                      size="large"
+                      disabled={newImages === 0}
+                    >
+                      {newImages > 0
                         ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
                         : "No New Images to Optimize"}
-                  </Button>
-                  {statsMap.completed > 0 && !isOptimizing && (
-                    <Button
-                      tone="critical"
-                      onClick={() => setShowRevertModal(true)}
-                      loading={isReverting}
-                    >
-                      Revert All to Originals
                     </Button>
-                  )}
-                </InlineStack>
-              </BlockStack>
-            </Card>
+                    {statsMap.completed > 0 && (
+                      <Button
+                        tone="critical"
+                        onClick={() => setShowRevertModal(true)}
+                        loading={isReverting}
+                      >
+                        Revert All to Originals
+                      </Button>
+                    )}
+                  </InlineStack>
+                </BlockStack>
+              </Card>
+            )}
 
             {/* Recent optimizations with thumbnails */}
             <Card>
