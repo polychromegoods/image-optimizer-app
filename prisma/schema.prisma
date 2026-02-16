@@ -55,6 +55,23 @@ model ImageOptimization {
   @@index([shop, status])
 }
 
+model OptimizationJob {
+  id              String   @id @default(uuid())
+  shop            String
+  status          String   @default("running") // running, completed, cancelled
+  totalImages     Int      @default(0)
+  processedCount  Int      @default(0)
+  errorCount      Int      @default(0)
+  skippedCount    Int      @default(0)
+  totalSaved      Int      @default(0)
+  currentImage    String?  // Name of image currently being processed
+  cancelled       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([shop, status])
+}
+
 model SeoSettings {
   id                String   @id @default(uuid())
   shop              String   @unique

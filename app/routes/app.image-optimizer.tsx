@@ -1,6 +1,11 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useLoaderData, useSubmit, useNavigation, useActionData } from "@remix-run/react";
+import {
+  useLoaderData,
+  useSubmit,
+  useNavigation,
+  useActionData,
+} from "@remix-run/react";
 import {
   Page,
   Layout,
@@ -14,12 +19,14 @@ import {
   InlineStack,
   Modal,
   Thumbnail,
-  Box,
+  Spinner,
 } from "@shopify/polaris";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import sharp from "sharp";
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function applyTemplate(
   template: string,
@@ -47,14 +54,12 @@ function makeFileName(
     .replace(/^-|-$/g, "");
 }
 
-// Helper: Upload a buffer to Shopify Files via staged upload and return the permanent file URL
 async function uploadToShopifyFiles(
   admin: any,
   buffer: Buffer,
   filename: string,
   mimeType: string,
 ): Promise<string> {
-  // Step 1: Create staged upload for FILE resource (permanent Shopify Files storage)
   const stagedUploadResponse = await admin.graphql(
     `#graphql
       mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
@@ -62,27 +67,16 @@ async function uploadToShopifyFiles(
           stagedTargets {
             url
             resourceUrl
-            parameters {
-              name
-              value
-            }
+            parameters { name value }
           }
-          userErrors {
-            field
-            message
-          }
+          userErrors { field message }
         }
       }
     `,
     {
       variables: {
         input: [
-          {
-            resource: "FILE",
-            filename,
-            mimeType,
-            httpMethod: "POST",
-          },
+          { resource: "FILE", filename, mimeType, httpMethod: "POST" },
         ],
       },
     },
@@ -90,12 +84,8 @@ async function uploadToShopifyFiles(
 
   const stagedData = await stagedUploadResponse.json();
   const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
+  if (!target) throw new Error("Failed to create staged upload for backup");
 
-  if (!target) {
-    throw new Error("Failed to create staged upload for backup");
-  }
-
-  // Step 2: Upload the file
   const uploadFormData = new FormData();
   for (const param of target.parameters) {
     uploadFormData.append(param.name, param.value);
@@ -110,32 +100,16 @@ async function uploadToShopifyFiles(
     method: "POST",
     body: uploadFormData,
   });
-
   if (!uploadResponse.ok) {
     throw new Error(`Backup upload failed: ${uploadResponse.statusText}`);
   }
 
-  // Step 3: Create the file in Shopify Files so it persists permanently
-  const fileCreateResponse = await admin.graphql(
+  await admin.graphql(
     `#graphql
       mutation fileCreate($files: [FileCreateInput!]!) {
         fileCreate(files: $files) {
-          files {
-            ... on GenericFile {
-              id
-              url
-            }
-            ... on MediaImage {
-              id
-              image {
-                url
-              }
-            }
-          }
-          userErrors {
-            field
-            message
-          }
+          files { ... on MediaImage { id image { url } } }
+          userErrors { field message }
         }
       }
     `,
@@ -152,19 +126,9 @@ async function uploadToShopifyFiles(
     },
   );
 
-  const fileData = await fileCreateResponse.json();
-  const createdFile = fileData.data?.fileCreate?.files?.[0];
-
-  if (fileData.data?.fileCreate?.userErrors?.length > 0) {
-    console.error("File create errors:", fileData.data.fileCreate.userErrors);
-  }
-
-  // The resourceUrl from staged upload is the permanent URL we can use
-  // The file might take a moment to process, but resourceUrl is immediately usable
   return target.resourceUrl;
 }
 
-// Helper: Upload WebP to Shopify via staged upload for product media
 async function uploadWebpForProduct(
   admin: any,
   webpBuffer: Buffer,
@@ -177,15 +141,9 @@ async function uploadWebpForProduct(
           stagedTargets {
             url
             resourceUrl
-            parameters {
-              name
-              value
-            }
+            parameters { name value }
           }
-          userErrors {
-            field
-            message
-          }
+          userErrors { field message }
         }
       }
     `,
@@ -205,10 +163,7 @@ async function uploadWebpForProduct(
 
   const stagedData = await stagedUploadResponse.json();
   const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
-
-  if (!target) {
-    throw new Error("Failed to create staged upload for WebP");
-  }
+  if (!target) throw new Error("Failed to create staged upload for WebP");
 
   const uploadFormData = new FormData();
   for (const param of target.parameters) {
@@ -224,13 +179,14 @@ async function uploadWebpForProduct(
     method: "POST",
     body: uploadFormData,
   });
-
   if (!uploadResponse.ok) {
     throw new Error(`WebP upload failed: ${uploadResponse.statusText}`);
   }
 
   return { url: target.url, resourceUrl: target.resourceUrl };
 }
+
+// ─── Loader ────────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -239,9 +195,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const stats = await db.imageOptimization.groupBy({
     by: ["status"],
     where: { shop },
-    _count: {
-      status: true,
-    },
+    _count: { status: true },
   });
 
   const recentOptimizations = await db.imageOptimization.findMany({
@@ -266,12 +220,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
                   node {
                     ... on MediaImage {
                       id
-                      image {
-                        url
-                        altText
-                        width
-                        height
-                      }
+                      image { url altText width height }
                       mediaContentType
                     }
                   }
@@ -301,27 +250,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
     for (const media of mediaImages) {
       const existing = await db.imageOptimization.findUnique({
-        where: {
-          shop_imageId: {
-            shop,
-            imageId: media.id,
-          },
-        },
+        where: { shop_imageId: { shop, imageId: media.id } },
       });
-
       if (!existing || existing.status === "failed") {
         newImages++;
       }
     }
   }
 
-  const seoSettings = await db.seoSettings.findUnique({
-    where: { shop },
-  });
+  const seoSettings = await db.seoSettings.findUnique({ where: { shop } });
 
-  // Count how many reverted records have a backupUrl (for recovery button)
-  const revertedWithBackup = await db.imageOptimization.count({
-    where: { shop, status: "reverted", backupUrl: { not: null } },
+  // Check for any running job
+  const activeJob = await db.optimizationJob.findFirst({
+    where: { shop, status: "running" },
+    orderBy: { createdAt: "desc" },
   });
 
   return json({
@@ -332,9 +274,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     totalImages,
     newImages,
     seoSettings,
-    revertedWithBackup,
+    activeJob,
   });
 };
+
+// ─── Action ────────────────────────────────────────────────────────────────────
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -346,6 +290,30 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ success: true, message: "Refreshed" });
   }
 
+  // ===== CANCEL OPTIMIZATION =====
+  if (actionType === "cancel") {
+    const jobId = formData.get("jobId") as string;
+    if (jobId) {
+      await db.optimizationJob.update({
+        where: { id: jobId },
+        data: { cancelled: true, status: "cancelled" },
+      });
+    } else {
+      // Cancel the most recent running job
+      const runningJob = await db.optimizationJob.findFirst({
+        where: { shop, status: "running" },
+        orderBy: { createdAt: "desc" },
+      });
+      if (runningJob) {
+        await db.optimizationJob.update({
+          where: { id: runningJob.id },
+          data: { cancelled: true, status: "cancelled" },
+        });
+      }
+    }
+    return json({ success: true, actionType: "cancel" });
+  }
+
   // ===== OPTIMIZE NEW or RETRY SINGLE =====
   if (actionType === "optimize_new" || actionType === "retry_single") {
     const seoSettings = await db.seoSettings.findUnique({
@@ -354,11 +322,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const shopResponse = await admin.graphql(
       `#graphql
-        query {
-          shop {
-            name
-          }
-        }
+        query { shop { name } }
       `,
     );
     const shopData = await shopResponse.json();
@@ -385,12 +349,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                     node {
                       ... on MediaImage {
                         id
-                        image {
-                          url
-                          altText
-                          width
-                          height
-                        }
+                        image { url altText width height }
                         mediaContentType
                       }
                     }
@@ -405,7 +364,40 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
 
     const data = await response.json();
-    const products = data.data?.products?.edges?.map((e: any) => e.node) || [];
+    const products =
+      data.data?.products?.edges?.map((e: any) => e.node) || [];
+
+    // Count total images to process
+    let imagesToProcess = 0;
+    for (const product of products) {
+      const mediaImages =
+        product.media?.edges
+          ?.map((e: any) => e.node)
+          ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
+      for (const media of mediaImages) {
+        if (targetImageId && media.id !== targetImageId) continue;
+        const existing = await db.imageOptimization.findUnique({
+          where: { shop_imageId: { shop, imageId: media.id } },
+        });
+        if (
+          actionType === "optimize_new" &&
+          existing &&
+          existing.status === "completed"
+        ) {
+          continue;
+        }
+        imagesToProcess++;
+      }
+    }
+
+    // Create a job record for tracking progress
+    const job = await db.optimizationJob.create({
+      data: {
+        shop,
+        status: "running",
+        totalImages: imagesToProcess,
+      },
+    });
 
     let processedCount = 0;
     let errorCount = 0;
@@ -422,18 +414,39 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       for (let i = 0; i < mediaImages.length; i++) {
         const media = mediaImages[i];
 
-        if (targetImageId && media.id !== targetImageId) {
-          continue;
+        if (targetImageId && media.id !== targetImageId) continue;
+
+        // ── Check for cancellation before each image ──
+        const currentJob = await db.optimizationJob.findUnique({
+          where: { id: job.id },
+        });
+        if (currentJob?.cancelled) {
+          // Update job as cancelled and return early
+          await db.optimizationJob.update({
+            where: { id: job.id },
+            data: {
+              status: "cancelled",
+              processedCount,
+              errorCount,
+              skippedCount,
+              totalSaved,
+              currentImage: null,
+            },
+          });
+          return json({
+            success: true,
+            actionType: "cancelled",
+            processedCount,
+            errorCount,
+            skippedCount,
+            totalSaved,
+            jobId: job.id,
+          });
         }
 
         try {
           const existing = await db.imageOptimization.findUnique({
-            where: {
-              shop_imageId: {
-                shop,
-                imageId: media.id,
-              },
-            },
+            where: { shop_imageId: { shop, imageId: media.id } },
           });
 
           if (
@@ -442,16 +455,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             existing.status === "completed"
           ) {
             skippedCount++;
+            // Update job progress
+            await db.optimizationJob.update({
+              where: { id: job.id },
+              data: { skippedCount },
+            });
             continue;
           }
 
-          await db.imageOptimization.upsert({
-            where: {
-              shop_imageId: {
-                shop,
-                imageId: media.id,
-              },
+          // Update job with current image name
+          const productName = product.title || "Unknown";
+          await db.optimizationJob.update({
+            where: { id: job.id },
+            data: {
+              currentImage: `${productName} (image ${i + 1})`,
+              processedCount,
+              errorCount,
+              skippedCount,
+              totalSaved,
             },
+          });
+
+          await db.imageOptimization.upsert({
+            where: { shop_imageId: { shop, imageId: media.id } },
             create: {
               shop,
               productId,
@@ -500,11 +526,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
           const originalSize = imageBuffer.length;
 
-          // Step 2: BACKUP - Upload original to Shopify Files for permanent storage
-          const originalExtension = media.image.url
-            .split("?")[0]
-            .split(".")
-            .pop() || "png";
+          // Step 2: BACKUP - Upload original to Shopify Files
+          const originalExtension =
+            media.image.url.split("?")[0].split(".").pop() || "png";
           const backupFilename = `backup-${media.id.split("/").pop()}.${originalExtension}`;
           const backupMimeType =
             originalExtension === "jpg" || originalExtension === "jpeg"
@@ -522,7 +546,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               backupMimeType,
             );
           } catch (backupError) {
-            console.error("Backup upload failed, skipping image:", backupError);
+            console.error(
+              "Backup upload failed, skipping image:",
+              backupError,
+            );
             throw new Error(
               `Backup failed for image ${media.id}: ${backupError}`,
             );
@@ -535,11 +562,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const webpSize = webpBuffer.length;
 
           // Step 4: Upload WebP for product media
-          const { resourceUrl: webpResourceUrl } = await uploadWebpForProduct(
-            admin,
-            webpBuffer,
-            fileName,
-          );
+          const { resourceUrl: webpResourceUrl } =
+            await uploadWebpForProduct(admin, webpBuffer, fileName);
 
           // Step 5: Delete original product media
           const deleteResponse = await admin.graphql(
@@ -547,21 +571,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
                 productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
                   deletedMediaIds
-                  mediaUserErrors {
-                    field
-                    message
-                  }
+                  mediaUserErrors { field message }
                 }
               }
             `,
             {
-              variables: {
-                productId,
-                mediaIds: [media.id],
-              },
+              variables: { productId, mediaIds: [media.id] },
             },
           );
-
           const deleteData = await deleteResponse.json();
           if (
             deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0
@@ -578,17 +595,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
                 productCreateMedia(media: $media, productId: $productId) {
                   media {
-                    ... on MediaImage {
-                      id
-                      image {
-                        url
-                      }
-                    }
+                    ... on MediaImage { id image { url } }
                   }
-                  mediaUserErrors {
-                    field
-                    message
-                  }
+                  mediaUserErrors { field message }
                 }
               }
             `,
@@ -607,7 +616,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
 
           const createData = await createMediaResponse.json();
-          const newMedia = createData.data?.productCreateMedia?.media?.[0];
+          const newMedia =
+            createData.data?.productCreateMedia?.media?.[0];
 
           if (
             createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
@@ -622,14 +632,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const savings = originalSize - webpSize;
           totalSaved += savings;
 
-          // Step 7: Save record with backupUrl for safe revert
           await db.imageOptimization.update({
-            where: {
-              shop_imageId: {
-                shop,
-                imageId: media.id,
-              },
-            },
+            where: { shop_imageId: { shop, imageId: media.id } },
             data: {
               webpUrl: newMedia?.image?.url || webpResourceUrl,
               webpGid: newMedia?.id || null,
@@ -637,22 +641,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               fileSize: originalSize,
               webpFileSize: webpSize,
               status: "completed",
-              altTextUpdated: seoSettings?.autoApplyOnOptimize ? true : false,
+              altTextUpdated: seoSettings?.autoApplyOnOptimize
+                ? true
+                : false,
             },
           });
 
           processedCount++;
+
+          // Update job progress after each successful image
+          await db.optimizationJob.update({
+            where: { id: job.id },
+            data: {
+              processedCount,
+              errorCount,
+              totalSaved,
+            },
+          });
         } catch (error) {
           console.error(`Error processing image ${media.id}:`, error);
           errorCount++;
 
           await db.imageOptimization.upsert({
-            where: {
-              shop_imageId: {
-                shop,
-                imageId: media.id,
-              },
-            },
+            where: { shop_imageId: { shop, imageId: media.id } },
             create: {
               shop,
               productId,
@@ -662,13 +673,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               originalAlt: media.image?.altText || "",
               status: "failed",
             },
-            update: {
-              status: "failed",
-            },
+            update: { status: "failed" },
+          });
+
+          await db.optimizationJob.update({
+            where: { id: job.id },
+            data: { errorCount },
           });
         }
       }
     }
+
+    // Mark job as completed
+    await db.optimizationJob.update({
+      where: { id: job.id },
+      data: {
+        status: "completed",
+        processedCount,
+        errorCount,
+        skippedCount,
+        totalSaved,
+        currentImage: null,
+      },
+    });
 
     return json({
       success: true,
@@ -677,6 +704,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       errorCount,
       skippedCount,
       totalSaved,
+      jobId: job.id,
     });
   }
 
@@ -691,48 +719,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
-        // Use backupUrl (permanent Shopify Files URL) instead of originalUrl
         const restoreSource = opt.backupUrl || opt.originalUrl;
 
-        // First verify the restore source is accessible
-        try {
-          const checkResponse = await fetch(restoreSource, { method: "HEAD" });
-          if (!checkResponse.ok) {
-            console.error(
-              `Restore source not accessible for ${opt.imageId}: ${checkResponse.status}`,
-            );
-            // Try the other URL as fallback
-            const fallbackUrl =
-              opt.backupUrl === restoreSource
-                ? opt.originalUrl
-                : opt.backupUrl;
-            if (fallbackUrl) {
-              const fallbackCheck = await fetch(fallbackUrl, {
-                method: "HEAD",
-              });
-              if (!fallbackCheck.ok) {
-                throw new Error("Neither backup nor original URL is accessible");
-              }
-            }
-          }
-        } catch (checkError) {
-          console.warn(
-            `URL check failed for ${opt.imageId}, attempting restore anyway:`,
-            checkError,
-          );
-        }
-
-        // Delete the WebP version from the product
         if (opt.webpGid) {
           const deleteResp = await admin.graphql(
             `#graphql
               mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
                 productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
                   deletedMediaIds
-                  mediaUserErrors {
-                    field
-                    message
-                  }
+                  mediaUserErrors { field message }
                 }
               }
             `,
@@ -754,23 +749,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           }
         }
 
-        // Re-create product media from the backup/original
         const createResp = await admin.graphql(
           `#graphql
             mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
               productCreateMedia(media: $media, productId: $productId) {
-                media {
-                  ... on MediaImage {
-                    id
-                    image {
-                      url
-                    }
-                  }
-                }
-                mediaUserErrors {
-                  field
-                  message
-                }
+                media { ... on MediaImage { id image { url } } }
+                mediaUserErrors { field message }
               }
             }
           `,
@@ -842,10 +826,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
               productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
                 deletedMediaIds
-                mediaUserErrors {
-                  field
-                  message
-                }
+                mediaUserErrors { field message }
               }
             }
           `,
@@ -862,18 +843,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         `#graphql
           mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
             productCreateMedia(media: $media, productId: $productId) {
-              media {
-                ... on MediaImage {
-                  id
-                  image {
-                    url
-                  }
-                }
-              }
-              mediaUserErrors {
-                field
-                message
-              }
+              media { ... on MediaImage { id image { url } } }
+              mediaUserErrors { field message }
             }
           }
         `,
@@ -892,7 +863,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
 
       const createData = await createResp.json();
-      if (createData.data?.productCreateMedia?.mediaUserErrors?.length > 0) {
+      if (
+        createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
+      ) {
         const errors = createData.data.productCreateMedia.mediaUserErrors
           .map((e: any) => e.message)
           .join(", ");
@@ -911,135 +884,152 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  // ===== RESTORE MISSING IMAGES =====
-  // This action finds all "reverted" records and tries to re-add images to products
-  // that are missing them, using backupUrl or originalUrl
-  if (actionType === "restore_missing") {
-    const revertedRecords = await db.imageOptimization.findMany({
-      where: { shop, status: "reverted" },
-    });
-
-    let restoredCount = 0;
-    let errorCount = 0;
-
-    for (const opt of revertedRecords) {
-      try {
-        // Try backupUrl first, then originalUrl
-        const restoreSource = opt.backupUrl || opt.originalUrl;
-
-        const createResp = await admin.graphql(
-          `#graphql
-            mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-              productCreateMedia(media: $media, productId: $productId) {
-                media {
-                  ... on MediaImage {
-                    id
-                    image {
-                      url
-                    }
-                  }
-                }
-                mediaUserErrors {
-                  field
-                  message
-                }
-              }
-            }
-          `,
-          {
-            variables: {
-              productId: opt.productId,
-              media: [
-                {
-                  alt: opt.originalAlt || "",
-                  mediaContentType: "IMAGE",
-                  originalSource: restoreSource,
-                },
-              ],
-            },
-          },
-        );
-
-        const createData = await createResp.json();
-        if (
-          createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
-        ) {
-          const errors = createData.data.productCreateMedia.mediaUserErrors
-            .map((e: any) => e.message)
-            .join(", ");
-          throw new Error(`Failed to restore: ${errors}`);
-        }
-
-        // Reset to pending so it can be re-optimized
-        await db.imageOptimization.update({
-          where: { id: opt.id },
-          data: { status: "restored" },
-        });
-
-        restoredCount++;
-      } catch (error) {
-        console.error(`Error restoring image ${opt.imageId}:`, error);
-        errorCount++;
-      }
-    }
-
-    return json({
-      success: true,
-      actionType: "restore",
-      restoredCount,
-      errorCount,
-    });
-  }
-
   return json({ success: false });
 };
+
+// ─── Component ─────────────────────────────────────────────────────────────────
 
 export default function ImageOptimizer() {
   const {
     shop,
-    stats,
-    recentOptimizations,
+    stats: initialStats,
+    recentOptimizations: initialOptimizations,
     products,
     totalImages,
     newImages,
     seoSettings,
-    revertedWithBackup,
+    activeJob: initialActiveJob,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
 
   const [showRevertModal, setShowRevertModal] = useState(false);
-  const [showRestoreModal, setShowRestoreModal] = useState(false);
   const [compareImage, setCompareImage] = useState<any>(null);
 
-  const isOptimizing =
-    navigation.state === "submitting" &&
-    navigation.formData?.get("action") === "optimize_new";
-  const isRefreshing =
-    navigation.state === "submitting" &&
-    navigation.formData?.get("action") === "refresh";
-  const isReverting =
-    navigation.state === "submitting" &&
-    (navigation.formData?.get("action") === "revert_all" ||
-      navigation.formData?.get("action") === "revert_single");
-  const isRetrying =
-    navigation.state === "submitting" &&
-    navigation.formData?.get("action") === "retry_single";
-  const isRestoring =
-    navigation.state === "submitting" &&
-    navigation.formData?.get("action") === "restore_missing";
+  // Live progress state
+  const [liveJob, setLiveJob] = useState<any>(initialActiveJob);
+  const [liveStats, setLiveStats] = useState<any>(initialStats);
+  const [liveOptimizations, setLiveOptimizations] = useState<any>(
+    initialOptimizations,
+  );
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const statsMap = stats.reduce(
+  const isSubmitting = navigation.state === "submitting";
+  const submittingAction = navigation.formData?.get("action");
+
+  const isOptimizing =
+    (isSubmitting && submittingAction === "optimize_new") ||
+    liveJob?.status === "running";
+  const isRefreshing = isSubmitting && submittingAction === "refresh";
+  const isReverting =
+    isSubmitting &&
+    (submittingAction === "revert_all" ||
+      submittingAction === "revert_single");
+  const isRetrying = isSubmitting && submittingAction === "retry_single";
+  const isCancelling = isSubmitting && submittingAction === "cancel";
+
+  // ── Polling for live updates during optimization ──
+  useEffect(() => {
+    const shouldPoll = liveJob?.status === "running" || isOptimizing;
+
+    if (shouldPoll && !pollingRef.current) {
+      pollingRef.current = setInterval(async () => {
+        try {
+          const resp = await fetch("/api/optimization-status", {
+            credentials: "same-origin",
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data.hasJob) {
+              setLiveJob(data.job);
+              if (data.stats) setLiveStats(data.stats);
+              if (data.recentOptimizations)
+                setLiveOptimizations(data.recentOptimizations);
+
+              // Stop polling if job is done
+              if (
+                data.job.status === "completed" ||
+                data.job.status === "cancelled"
+              ) {
+                if (pollingRef.current) {
+                  clearInterval(pollingRef.current);
+                  pollingRef.current = null;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.error("Polling error:", e);
+        }
+      }, 2000);
+    }
+
+    return () => {
+      if (pollingRef.current && !isOptimizing && liveJob?.status !== "running") {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+    };
+  }, [isOptimizing, liveJob?.status]);
+
+  // Reset live state when loader data changes (e.g., after form submission completes)
+  useEffect(() => {
+    setLiveStats(initialStats);
+    setLiveOptimizations(initialOptimizations);
+    if (initialActiveJob) {
+      setLiveJob(initialActiveJob);
+    } else if (
+      liveJob?.status === "completed" ||
+      liveJob?.status === "cancelled"
+    ) {
+      // Keep the finished job visible for the banner
+    }
+  }, [initialStats, initialOptimizations, initialActiveJob]);
+
+  // Start polling when optimization begins
+  useEffect(() => {
+    if (
+      isSubmitting &&
+      submittingAction === "optimize_new" &&
+      !pollingRef.current
+    ) {
+      // Small delay to let the job be created
+      const timeout = setTimeout(() => {
+        setLiveJob({ status: "running" });
+      }, 500);
+      return () => clearTimeout(timeout);
+    }
+  }, [isSubmitting, submittingAction]);
+
+  // Use live data when available
+  const stats = liveStats || initialStats;
+  const recentOptimizations = liveOptimizations || initialOptimizations;
+
+  const statsMap = (Array.isArray(stats) ? stats : []).reduce(
     (acc: any, stat: any) => {
       acc[stat.status] = stat._count.status;
       return acc;
     },
-    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0, restored: 0 },
+    {
+      pending: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+      reverted: 0,
+    },
   );
 
   const completionPercentage =
     totalImages > 0 ? (statsMap.completed / totalImages) * 100 : 0;
+
+  // Job progress percentage
+  const jobProgress =
+    liveJob?.totalImages > 0
+      ? ((liveJob.processedCount + liveJob.errorCount + liveJob.skippedCount) /
+          liveJob.totalImages) *
+        100
+      : 0;
 
   const handleOptimizeNew = () => {
     const formData = new FormData();
@@ -1074,18 +1064,20 @@ export default function ImageOptimizer() {
     submit(formData, { method: "post" });
   };
 
-  const handleRestoreMissing = useCallback(() => {
+  const handleCancel = () => {
     const formData = new FormData();
-    formData.append("action", "restore_missing");
+    formData.append("action", "cancel");
+    if (liveJob?.id) {
+      formData.append("jobId", liveJob.id);
+    }
     submit(formData, { method: "post" });
-    setShowRestoreModal(false);
-  }, [submit]);
+  };
 
   const handleCompare = (opt: any) => {
     setCompareImage(opt);
   };
 
-  // Build a product lookup map for performance
+  // Build a product lookup map
   const productMap: Record<string, string> = {};
   for (const p of products) {
     productMap[p.id] = p.title;
@@ -1100,7 +1092,7 @@ export default function ImageOptimizer() {
         <Layout.Section>
           <BlockStack gap="500">
             {/* Result banners */}
-            {actionData?.actionType === "optimize" && (
+            {actionData?.actionType === "optimize" && !isOptimizing && (
               <Banner
                 tone={actionData.errorCount > 0 ? "warning" : "success"}
                 title="Optimization Complete"
@@ -1110,6 +1102,19 @@ export default function ImageOptimizer() {
                   {actionData.skippedCount} | Errors: {actionData.errorCount}
                   {actionData.totalSaved > 0 &&
                     ` | Total saved: ${(actionData.totalSaved / 1024).toFixed(1)} KB`}
+                </p>
+              </Banner>
+            )}
+
+            {actionData?.actionType === "cancelled" && (
+              <Banner tone="warning" title="Optimization Cancelled">
+                <p>
+                  Stopped after processing {actionData.processedCount} image
+                  {actionData.processedCount !== 1 ? "s" : ""}.
+                  {actionData.errorCount > 0 &&
+                    ` ${actionData.errorCount} error(s).`}
+                  {actionData.totalSaved > 0 &&
+                    ` Saved ${(actionData.totalSaved / 1024).toFixed(1)} KB so far.`}
                 </p>
               </Banner>
             )}
@@ -1139,21 +1144,8 @@ export default function ImageOptimizer() {
               >
                 <p>
                   Reverted {actionData.revertedCount} image
-                  {actionData.revertedCount !== 1 ? "s" : ""} back to originals.
-                  {actionData.errorCount > 0 &&
-                    ` ${actionData.errorCount} error(s) occurred.`}
-                </p>
-              </Banner>
-            )}
-
-            {actionData?.actionType === "restore" && (
-              <Banner
-                tone={actionData.errorCount > 0 ? "warning" : "success"}
-                title="Restore Complete"
-              >
-                <p>
-                  Restored {actionData.restoredCount} image
-                  {actionData.restoredCount !== 1 ? "s" : ""}.
+                  {actionData.revertedCount !== 1 ? "s" : ""} back to
+                  originals.
                   {actionData.errorCount > 0 &&
                     ` ${actionData.errorCount} error(s) occurred.`}
                 </p>
@@ -1163,11 +1155,62 @@ export default function ImageOptimizer() {
             {seoSettings?.autoApplyOnOptimize && (
               <Banner tone="info">
                 <p>
-                  SEO alt text and filenames will be applied automatically during
-                  optimization.
+                  SEO alt text and filenames will be applied automatically
+                  during optimization.
                   <a href="/app/settings"> Edit templates</a>
                 </p>
               </Banner>
+            )}
+
+            {/* Live progress card - shown during optimization */}
+            {isOptimizing && liveJob && (
+              <Card>
+                <BlockStack gap="400">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <InlineStack gap="200" blockAlign="center">
+                      <Spinner size="small" />
+                      <Text as="h2" variant="headingMd">
+                        Optimizing Images...
+                      </Text>
+                    </InlineStack>
+                    <Button
+                      tone="critical"
+                      onClick={handleCancel}
+                      loading={isCancelling}
+                    >
+                      Cancel
+                    </Button>
+                  </InlineStack>
+
+                  <ProgressBar
+                    progress={Math.min(jobProgress, 100)}
+                    size="small"
+                    tone="primary"
+                  />
+
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodySm">
+                      {liveJob.processedCount || 0} of{" "}
+                      {liveJob.totalImages || "?"} images processed
+                      {(liveJob.errorCount || 0) > 0 &&
+                        ` | ${liveJob.errorCount} error(s)`}
+                      {(liveJob.skippedCount || 0) > 0 &&
+                        ` | ${liveJob.skippedCount} skipped`}
+                    </Text>
+                    {liveJob.currentImage && (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Currently processing: {liveJob.currentImage}
+                      </Text>
+                    )}
+                    {(liveJob.totalSaved || 0) > 0 && (
+                      <Text as="p" variant="bodySm" tone="success">
+                        Saved so far:{" "}
+                        {((liveJob.totalSaved || 0) / 1024).toFixed(1)} KB
+                      </Text>
+                    )}
+                  </BlockStack>
+                </BlockStack>
+              </Card>
             )}
 
             {/* Refresh card */}
@@ -1181,18 +1224,22 @@ export default function ImageOptimizer() {
                   them.
                 </Text>
                 <div>
-                  <Button onClick={handleRefresh} loading={isRefreshing}>
+                  <Button
+                    onClick={handleRefresh}
+                    loading={isRefreshing}
+                    disabled={isOptimizing}
+                  >
                     Refresh
                   </Button>
                 </div>
               </BlockStack>
             </Card>
 
-            {newImages > 0 && (
+            {newImages > 0 && !isOptimizing && (
               <Banner tone="info">
                 <p>
-                  Found {newImages} new image{newImages !== 1 ? "s" : ""} ready
-                  to optimize.
+                  Found {newImages} new image{newImages !== 1 ? "s" : ""}{" "}
+                  ready to optimize.
                 </p>
               </Banner>
             )}
@@ -1207,8 +1254,8 @@ export default function ImageOptimizer() {
                 <BlockStack gap="200">
                   <Text as="p">Total images: {totalImages}</Text>
                   <Text as="p">
-                    Optimized: {statsMap.completed} | Failed: {statsMap.failed} |
-                    Reverted: {statsMap.reverted || 0}
+                    Optimized: {statsMap.completed} | Failed:{" "}
+                    {statsMap.failed} | Reverted: {statsMap.reverted || 0}
                   </Text>
                 </BlockStack>
                 <InlineStack gap="300">
@@ -1216,28 +1263,24 @@ export default function ImageOptimizer() {
                     variant="primary"
                     onClick={handleOptimizeNew}
                     size="large"
-                    loading={isOptimizing}
-                    disabled={newImages === 0}
+                    loading={
+                      isSubmitting && submittingAction === "optimize_new"
+                    }
+                    disabled={newImages === 0 || isOptimizing}
                   >
-                    {newImages > 0
-                      ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
-                      : "No New Images to Optimize"}
+                    {isOptimizing
+                      ? "Optimizing..."
+                      : newImages > 0
+                        ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
+                        : "No New Images to Optimize"}
                   </Button>
-                  {statsMap.completed > 0 && (
+                  {statsMap.completed > 0 && !isOptimizing && (
                     <Button
                       tone="critical"
                       onClick={() => setShowRevertModal(true)}
                       loading={isReverting}
                     >
                       Revert All to Originals
-                    </Button>
-                  )}
-                  {(statsMap.reverted || 0) > 0 && (
-                    <Button
-                      onClick={() => setShowRestoreModal(true)}
-                      loading={isRestoring}
-                    >
-                      Restore Missing Images
                     </Button>
                   )}
                 </InlineStack>
@@ -1272,7 +1315,6 @@ export default function ImageOptimizer() {
                           <th style={{ padding: "12px 8px" }}>Original</th>
                           <th style={{ padding: "12px 8px" }}>WebP</th>
                           <th style={{ padding: "12px 8px" }}>Savings</th>
-                          <th style={{ padding: "12px 8px" }}>Backup</th>
                           <th style={{ padding: "12px 8px" }}>Actions</th>
                         </tr>
                       </thead>
@@ -1354,14 +1396,23 @@ export default function ImageOptimizer() {
                                       ? "success"
                                       : opt.status === "failed"
                                         ? "critical"
-                                        : opt.status === "reverted"
-                                          ? "warning"
-                                          : opt.status === "restored"
-                                            ? "info"
+                                        : opt.status === "processing"
+                                          ? "attention"
+                                          : opt.status === "reverted"
+                                            ? "warning"
                                             : "info"
                                   }
                                 >
-                                  {opt.status}
+                                  {opt.status === "processing" ? (
+                                    <InlineStack
+                                      gap="100"
+                                      blockAlign="center"
+                                    >
+                                      <span>processing</span>
+                                    </InlineStack>
+                                  ) : (
+                                    opt.status
+                                  )}
                                 </Badge>
                               </td>
 
@@ -1400,15 +1451,6 @@ export default function ImageOptimizer() {
                                 )}
                               </td>
 
-                              {/* Backup status */}
-                              <td style={{ padding: "8px" }}>
-                                {opt.backupUrl ? (
-                                  <Badge tone="success">Backed up</Badge>
-                                ) : (
-                                  <Badge tone="warning">No backup</Badge>
-                                )}
-                              </td>
-
                               {/* Actions */}
                               <td style={{ padding: "8px" }}>
                                 <InlineStack gap="200">
@@ -1416,7 +1458,9 @@ export default function ImageOptimizer() {
                                     <>
                                       <Button
                                         size="slim"
-                                        onClick={() => handleCompare(opt)}
+                                        onClick={() =>
+                                          handleCompare(opt)
+                                        }
                                       >
                                         Compare
                                       </Button>
@@ -1454,7 +1498,8 @@ export default function ImageOptimizer() {
                   </div>
                 ) : (
                   <Text as="p" tone="subdued">
-                    No optimizations yet. Click Refresh, then Optimize to start.
+                    No optimizations yet. Click Refresh, then Optimize to
+                    start.
                   </Text>
                 )}
               </BlockStack>
@@ -1483,36 +1528,9 @@ export default function ImageOptimizer() {
         >
           <Modal.Section>
             <Text as="p">
-              This will restore all {statsMap.completed} optimized images back to
-              their originals using the backed-up copies. Your WebP versions will
-              be removed from the products.
-            </Text>
-          </Modal.Section>
-        </Modal>
-      )}
-
-      {/* Restore missing images modal */}
-      {showRestoreModal && (
-        <Modal
-          open={showRestoreModal}
-          onClose={() => setShowRestoreModal(false)}
-          title="Restore Missing Images?"
-          primaryAction={{
-            content: "Restore Images",
-            onAction: handleRestoreMissing,
-          }}
-          secondaryActions={[
-            {
-              content: "Cancel",
-              onAction: () => setShowRestoreModal(false),
-            },
-          ]}
-        >
-          <Modal.Section>
-            <Text as="p">
-              This will attempt to restore {statsMap.reverted || 0} reverted
-              images back to their products using backup copies. Images that were
-              lost during a failed revert will be re-added.
+              This will restore all {statsMap.completed} optimized images
+              back to their originals using the backed-up copies. Your WebP
+              versions will be removed from the products.
             </Text>
           </Modal.Section>
         </Modal>
@@ -1534,7 +1552,11 @@ export default function ImageOptimizer() {
         >
           <Modal.Section>
             <div
-              style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}
+              style={{
+                display: "flex",
+                gap: "24px",
+                flexWrap: "wrap",
+              }}
             >
               {/* Original */}
               <div style={{ flex: 1, minWidth: "250px" }}>
@@ -1556,7 +1578,9 @@ export default function ImageOptimizer() {
                     }}
                   >
                     <img
-                      src={compareImage.backupUrl || compareImage.originalUrl}
+                      src={
+                        compareImage.backupUrl || compareImage.originalUrl
+                      }
                       alt="Original"
                       style={{
                         width: "100%",
@@ -1578,17 +1602,22 @@ export default function ImageOptimizer() {
                         ? `${(compareImage.webpFileSize / 1024).toFixed(1)} KB`
                         : ""}
                     </Text>
-                    {compareImage.fileSize && compareImage.webpFileSize && (
-                      <Text as="span" variant="bodySm" tone="success">
-                        {(
-                          ((compareImage.fileSize -
-                            compareImage.webpFileSize) /
-                            compareImage.fileSize) *
-                          100
-                        ).toFixed(1)}
-                        % smaller
-                      </Text>
-                    )}
+                    {compareImage.fileSize &&
+                      compareImage.webpFileSize && (
+                        <Text
+                          as="span"
+                          variant="bodySm"
+                          tone="success"
+                        >
+                          {(
+                            ((compareImage.fileSize -
+                              compareImage.webpFileSize) /
+                              compareImage.fileSize) *
+                            100
+                          ).toFixed(1)}
+                          % smaller
+                        </Text>
+                      )}
                   </InlineStack>
                   <div
                     style={{
