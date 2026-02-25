@@ -1,0 +1,296 @@
+# QA Test Plan — Image Compression WebPro (Shopify App)
+
+**Version:** 1.0
+**Date:** February 25, 2026
+**App:** Image Compression WebPro
+**Platform:** Shopify Admin (Embedded App)
+**Deployment:** Railway (auto-deploy from GitHub `main` branch)
+
+---
+
+## 1. Overview
+
+This document provides a comprehensive manual QA test plan for the Image Compression WebPro Shopify app. The app optimizes product images by converting them to WebP format, manages backups for safe revert, applies SEO alt text/filenames, and provides real-time progress tracking with cancellation support.
+
+### Scope
+
+| Area | Covered |
+|---|---|
+| Image optimization (WebP conversion) | Yes |
+| Backup and revert (single + bulk) | Yes |
+| Cancel in-progress optimization | Yes |
+| Live progress updates (polling) | Yes |
+| Retry failed images | Yes |
+| SEO alt text & filename templates | Yes |
+| Compare modal (original vs WebP) | Yes |
+| Edge cases & error handling | Yes |
+| Cross-browser compatibility | Yes |
+| Performance under load | Yes |
+
+### Prerequisites
+
+- A Shopify development/test store with at least 5 products, each having 2-5 images (mix of PNG, JPG, and large images)
+- The app installed on the test store
+- Access to Shopify Admin > Products, Content > Files, and the app dashboard
+- A stable internet connection (some tests involve large file uploads)
+
+---
+
+## 2. Test Environment Setup
+
+| Item | Details |
+|---|---|
+| Shopify Store | Development or Partner test store |
+| App URL | `https://image-optimizer-app-production.up.railway.app` |
+| Browser | Chrome (latest), Firefox (latest), Safari (latest) |
+| Database | PostgreSQL on Railway |
+| Node.js | v20.x or v22.12+ |
+
+### Test Data Preparation
+
+1. Create or ensure at least **5 products** exist with images:
+   - Product A: 1 image (small, < 50 KB PNG)
+   - Product B: 3 images (medium, 100-500 KB JPG)
+   - Product C: 5 images (large, > 1 MB PNG)
+   - Product D: 1 image (already WebP format)
+   - Product E: 2 images (with existing alt text)
+2. Note the original file sizes and alt text for comparison after optimization.
+
+---
+
+## 3. Test Cases
+
+### 3.1 — App Installation & Navigation
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| NAV-01 | App loads in Shopify Admin | Open the app from Shopify Admin > Apps | App loads within the Shopify Admin iframe, showing "Image Optimizer" page title | P0 |
+| NAV-02 | Navigation to Settings | Click "Settings" or navigate to `/app/settings` | Settings page loads with alt text and filename template fields | P0 |
+| NAV-03 | Navigation back to Optimizer | From Settings, navigate back to Image Optimizer | Optimizer page loads with current stats | P1 |
+
+### 3.2 — Refresh / Sync Images
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| REF-01 | Refresh detects new images | Click "Refresh" button | Page reloads, "Found X new images ready to optimize" banner appears | P0 |
+| REF-02 | Refresh with no new images | Click "Refresh" when all images are already tracked | "No New Images to Optimize" button remains disabled | P1 |
+| REF-03 | Refresh after adding a product | Add a new product with images in Shopify, then click Refresh | New images are detected and count increases | P0 |
+| REF-04 | Refresh button disabled during optimization | Start optimization, then check Refresh button | Refresh button should be disabled/greyed out | P1 |
+
+### 3.3 — Image Optimization
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| OPT-01 | Optimize all new images | Click "Optimize X New Images" button | Optimization starts, live progress card appears with spinner and progress bar | P0 |
+| OPT-02 | Progress bar updates in real-time | Watch the live progress card during optimization | Counter increments ("X of Y images processed"), progress bar fills, current image name shown | P0 |
+| OPT-03 | Savings counter updates | Watch "Saved so far" during optimization | Green text shows cumulative KB saved, increasing with each image | P1 |
+| OPT-04 | Optimization completes successfully | Wait for all images to finish | Green "Optimization Complete" banner appears with processed/skipped/error counts and total saved | P0 |
+| OPT-05 | Already-optimized images are skipped | Run optimization again after completing once | Images with "completed" status are skipped; skipped count shown | P0 |
+| OPT-06 | WebP file is smaller than original | Check the results table after optimization | WebP size column shows smaller value than Original; Savings column shows positive percentage | P0 |
+| OPT-07 | Product media is replaced in Shopify | Go to Shopify Admin > Products > [optimized product] | Product images should now be WebP format | P0 |
+| OPT-08 | Backup is created in Shopify Files | Go to Shopify Admin > Content > Files | Backup files (named `backup-XXXXX.png/jpg`) should exist | P0 |
+| OPT-09 | Duplicate progress bar not shown | During optimization, check the page layout | Only the live progress card should be visible; the static "Optimization Progress" card should be hidden | P1 |
+
+### 3.4 — Cancel Optimization
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| CAN-01 | Cancel button is visible during optimization | Start optimization | Red "Cancel" button appears in the live progress card | P0 |
+| CAN-02 | Cancel stops processing | Click "Cancel" during optimization | Processing stops within a few seconds; yellow "Optimization Cancelled" banner appears | P0 |
+| CAN-03 | Already-processed images are kept | After cancelling, check the results table | Images processed before cancel show "completed" status with valid WebP URLs | P0 |
+| CAN-04 | Unprocessed images remain pending | After cancelling, check remaining images | Images not yet processed should still show "pending" or not appear in the table | P1 |
+| CAN-05 | Can optimize again after cancel | After cancelling, click "Optimize X New Images" | Remaining unprocessed images are optimized in a new run | P0 |
+| CAN-06 | Cancel button shows loading state | Click Cancel and observe | Button shows loading spinner while cancel is being processed | P2 |
+
+### 3.5 — Revert (Single Image)
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| REV-01 | Revert button visible for completed images | Check the Actions column for a "completed" row | "Revert" button is visible | P0 |
+| REV-02 | Single revert restores original | Click "Revert" on a completed image | Status changes to "reverted"; original image is restored on the product in Shopify Admin | P0 |
+| REV-03 | Reverted image uses backup URL | After reverting, check the product in Shopify | Image should be the original (not corrupted or missing) | P0 |
+| REV-04 | Reverted image can be re-optimized | After reverting, click Refresh then Optimize | The reverted image appears as a new image and can be optimized again | P1 |
+
+### 3.6 — Revert All
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| RVA-01 | Revert All button visible when images are optimized | Check the Optimization Progress card | "Revert All to Originals" button is visible when completed count > 0 | P0 |
+| RVA-02 | Confirmation modal appears | Click "Revert All to Originals" | Modal appears asking to confirm, showing the count of images to revert | P0 |
+| RVA-03 | Cancel the modal | Click "Cancel" in the confirmation modal | Modal closes, no action taken | P1 |
+| RVA-04 | Revert All restores all images | Click "Revert All" in the modal | All completed images are reverted; banner shows "Reverted X images back to originals" | P0 |
+| RVA-05 | All products show original images | After Revert All, check products in Shopify Admin | All products should display their original (non-WebP) images | P0 |
+| RVA-06 | Revert All with mixed statuses | Have some completed, some failed, some pending images | Only "completed" images are reverted; failed/pending are untouched | P1 |
+
+### 3.7 — Retry Failed Images
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| RTY-01 | Retry button visible for failed images | Check the Actions column for a "failed" row | Blue "Retry" button is visible | P0 |
+| RTY-02 | Retry processes the failed image | Click "Retry" on a failed image | Image is re-processed; status changes to "completed" if successful | P0 |
+| RTY-03 | Retry shows result banner | After retry completes | "Retry Complete" banner appears with processed/error counts | P1 |
+| RTY-04 | Retry on permanently failing image | Retry an image that will always fail (e.g., deleted source) | Status remains "failed"; error count increments | P1 |
+
+### 3.8 — Compare Modal
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| CMP-01 | Compare button opens modal | Click "Compare" on a completed row | Modal opens showing "Compare: Original vs WebP" title | P0 |
+| CMP-02 | Thumbnail click opens modal | Click the thumbnail of a completed image | Same compare modal opens | P1 |
+| CMP-03 | Original image displayed | Check the left side of the modal | Original image is shown with its file size in KB | P0 |
+| CMP-04 | WebP image displayed | Check the right side of the modal | WebP image is shown with its file size and "X% smaller" text | P0 |
+| CMP-05 | Close modal | Click "Close" button or click outside the modal | Modal closes | P1 |
+| CMP-06 | Images are visually comparable | Compare both images visually | Both images should look nearly identical in quality | P1 |
+
+### 3.9 — SEO Settings
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| SEO-01 | Default templates are set | Open Settings page for the first time | Alt text template defaults to `#product_name#`, filename to `#product_name#` | P1 |
+| SEO-02 | Save custom templates | Change templates and click "Save" | Green "Settings Saved" banner appears | P0 |
+| SEO-03 | Preview updates in real-time | Type in the template fields | Preview text below the field updates as you type | P1 |
+| SEO-04 | Templates applied during optimization | Enable "Auto-apply", set templates, then optimize | Optimized images have alt text and filenames matching the templates | P0 |
+| SEO-05 | Apply SEO Now button | Click "Apply Alt Text Now" | Alt text is updated on all product images; banner shows count | P1 |
+| SEO-06 | Template variables replaced correctly | Use `#product_name# by #vendor# - Image #image_number#` | Alt text reads e.g., "Blue Mug by My Brand - Image 1" | P0 |
+| SEO-07 | Auto-apply banner on optimizer page | Enable auto-apply in Settings, go to Optimizer | Info banner says "SEO alt text and filenames will be applied automatically" | P2 |
+
+### 3.10 — Results Table
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| TBL-01 | Table shows recent optimizations | After optimizing, check the table | Table shows rows with Preview, Product, Status, Original, WebP, Savings, Actions columns | P0 |
+| TBL-02 | Thumbnails are displayed | Check the Preview column | Small thumbnail images are shown for each row | P1 |
+| TBL-03 | Product names are shown | Check the Product column | Product title is displayed (not raw GID) | P1 |
+| TBL-04 | Status badges have correct colors | Check the Status column | completed=green, failed=red, processing=yellow, reverted=orange, pending=blue | P1 |
+| TBL-05 | Table updates during optimization | Watch the table while optimization runs | Rows update from "processing" to "completed" or "failed" in real-time | P0 |
+| TBL-06 | Table shows up to 50 rows | Optimize more than 50 images | Table shows the 50 most recent optimizations | P2 |
+
+### 3.11 — Edge Cases & Error Handling
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| ERR-01 | Optimize with no products | Remove all products, click Refresh then Optimize | "No New Images to Optimize" button is disabled | P1 |
+| ERR-02 | Optimize with deleted product image | Delete a product image in Shopify while optimization is running | That image fails gracefully; other images continue processing | P1 |
+| ERR-03 | Network interruption during optimization | Disconnect network briefly during optimization | App recovers; failed images show "failed" status with Retry option | P1 |
+| ERR-04 | Revert when backup URL is missing | Attempt to revert an image optimized before the backup feature was added | Revert attempts using originalUrl; may fail gracefully with error count | P1 |
+| ERR-05 | Very large image (> 10 MB) | Add a product with a 10+ MB image, optimize | Image is processed (may take longer); no timeout crash | P2 |
+| ERR-06 | Already WebP image | Add a product with a .webp image, optimize | Image is either skipped or re-compressed; no error | P2 |
+| ERR-07 | Concurrent optimization attempts | Open app in two browser tabs, click Optimize in both | Only one optimization runs; second is blocked or handled gracefully | P2 |
+| ERR-08 | Browser refresh during optimization | Refresh the browser page while optimization is running | Optimization continues server-side; page reloads and shows live progress | P1 |
+
+### 3.12 — Performance
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| PRF-01 | Optimize 10 images | Optimize a batch of 10 images | Completes within 5 minutes | P1 |
+| PRF-02 | Optimize 100+ images | Optimize a batch of 100+ images | Completes without timeout; progress updates remain responsive | P1 |
+| PRF-03 | Polling does not degrade performance | Monitor browser DevTools Network tab during optimization | Polling requests are small (< 5 KB) and occur every ~2 seconds | P2 |
+| PRF-04 | Page load time | Navigate to the Image Optimizer page | Page loads within 3 seconds | P2 |
+
+---
+
+## 4. Test Execution Checklist
+
+Use this checklist during QA testing. Mark each test as Pass (P), Fail (F), Blocked (B), or Skipped (S).
+
+| ID | Result | Notes |
+|---|---|---|
+| NAV-01 | | |
+| NAV-02 | | |
+| NAV-03 | | |
+| REF-01 | | |
+| REF-02 | | |
+| REF-03 | | |
+| REF-04 | | |
+| OPT-01 | | |
+| OPT-02 | | |
+| OPT-03 | | |
+| OPT-04 | | |
+| OPT-05 | | |
+| OPT-06 | | |
+| OPT-07 | | |
+| OPT-08 | | |
+| OPT-09 | | |
+| CAN-01 | | |
+| CAN-02 | | |
+| CAN-03 | | |
+| CAN-04 | | |
+| CAN-05 | | |
+| CAN-06 | | |
+| REV-01 | | |
+| REV-02 | | |
+| REV-03 | | |
+| REV-04 | | |
+| RVA-01 | | |
+| RVA-02 | | |
+| RVA-03 | | |
+| RVA-04 | | |
+| RVA-05 | | |
+| RVA-06 | | |
+| RTY-01 | | |
+| RTY-02 | | |
+| RTY-03 | | |
+| RTY-04 | | |
+| CMP-01 | | |
+| CMP-02 | | |
+| CMP-03 | | |
+| CMP-04 | | |
+| CMP-05 | | |
+| CMP-06 | | |
+| SEO-01 | | |
+| SEO-02 | | |
+| SEO-03 | | |
+| SEO-04 | | |
+| SEO-05 | | |
+| SEO-06 | | |
+| SEO-07 | | |
+| TBL-01 | | |
+| TBL-02 | | |
+| TBL-03 | | |
+| TBL-04 | | |
+| TBL-05 | | |
+| TBL-06 | | |
+| ERR-01 | | |
+| ERR-02 | | |
+| ERR-03 | | |
+| ERR-04 | | |
+| ERR-05 | | |
+| ERR-06 | | |
+| ERR-07 | | |
+| ERR-08 | | |
+| PRF-01 | | |
+| PRF-02 | | |
+| PRF-03 | | |
+| PRF-04 | | |
+
+---
+
+## 5. Bug Reporting Template
+
+When a test fails, file a bug using this format:
+
+```
+**Bug ID:** [auto-increment]
+**Test Case ID:** [e.g., OPT-03]
+**Severity:** P0 (blocker) / P1 (major) / P2 (minor) / P3 (cosmetic)
+**Summary:** [One-line description]
+**Steps to Reproduce:**
+1. ...
+2. ...
+3. ...
+**Expected Result:** [What should happen]
+**Actual Result:** [What actually happened]
+**Screenshots/Videos:** [Attach if applicable]
+**Browser/OS:** [e.g., Chrome 122 / macOS 14.3]
+**Notes:** [Any additional context]
+```
+
+---
+
+## 6. Sign-Off
+
+| Role | Name | Date | Signature |
+|---|---|---|---|
+| QA Tester | | | |
+| Developer | | | |
+| Product Owner | | | |

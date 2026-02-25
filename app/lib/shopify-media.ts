@@ -1,0 +1,181 @@
+import type { ShopifyAdmin, StagedUploadTarget, ShopifyProduct, ShopifyMediaImage } from "./types";
+import {
+  MUTATION_STAGED_UPLOADS_CREATE,
+  MUTATION_FILE_CREATE,
+  MUTATION_PRODUCT_DELETE_MEDIA,
+  MUTATION_PRODUCT_CREATE_MEDIA,
+} from "./constants";
+
+// ─── Staged Upload Helpers ─────────────────────────────────────────────────────
+
+/**
+ * Create a staged upload target in Shopify for a given file.
+ */
+async function createStagedUpload(
+  admin: ShopifyAdmin,
+  resource: "FILE" | "IMAGE",
+  filename: string,
+  mimeType: string,
+): Promise<StagedUploadTarget> {
+  const response = await admin.graphql(MUTATION_STAGED_UPLOADS_CREATE, {
+    variables: {
+      input: [{ resource, filename, mimeType, httpMethod: "POST" }],
+    },
+  });
+
+  const data = await response.json();
+  const target = data.data?.stagedUploadsCreate?.stagedTargets?.[0];
+  const errors = data.data?.stagedUploadsCreate?.userErrors;
+
+  if (!target) {
+    const errorMsg = errors?.map((e: { message: string }) => e.message).join(", ") || "Unknown error";
+    throw new Error(`Failed to create staged upload for ${filename}: ${errorMsg}`);
+  }
+
+  return target;
+}
+
+/**
+ * Upload a buffer to a staged upload target.
+ */
+async function uploadToStagedTarget(
+  target: StagedUploadTarget,
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+): Promise<void> {
+  const formData = new FormData();
+  for (const param of target.parameters) {
+    formData.append(param.name, param.value);
+  }
+  formData.append("file", new Blob([buffer], { type: mimeType }), filename);
+
+  const response = await fetch(target.url, { method: "POST", body: formData });
+  if (!response.ok) {
+    throw new Error(`Upload to staged target failed (${response.status}): ${response.statusText}`);
+  }
+}
+
+// ─── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Upload a backup of the original image to Shopify Files (permanent storage).
+ * Returns the resourceUrl that can be used to restore the image later.
+ */
+export async function uploadBackupToFiles(
+  admin: ShopifyAdmin,
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+): Promise<string> {
+  const target = await createStagedUpload(admin, "FILE", filename, mimeType);
+  await uploadToStagedTarget(target, buffer, filename, mimeType);
+
+  // Register the file in Shopify's file storage
+  await admin.graphql(MUTATION_FILE_CREATE, {
+    variables: {
+      files: [
+        {
+          alt: "Backup original image",
+          contentType: "IMAGE",
+          originalSource: target.resourceUrl,
+        },
+      ],
+    },
+  });
+
+  return target.resourceUrl;
+}
+
+/**
+ * Upload a WebP image for use as product media.
+ * Returns the resourceUrl needed for productCreateMedia.
+ */
+export async function uploadWebpImage(
+  admin: ShopifyAdmin,
+  webpBuffer: Buffer,
+  fileName: string,
+): Promise<string> {
+  const fullFilename = `${fileName}.webp`;
+  const target = await createStagedUpload(admin, "IMAGE", fullFilename, "image/webp");
+  await uploadToStagedTarget(target, webpBuffer, fullFilename, "image/webp");
+  return target.resourceUrl;
+}
+
+/**
+ * Delete media from a product.
+ */
+export async function deleteProductMedia(
+  admin: ShopifyAdmin,
+  productId: string,
+  mediaIds: string[],
+): Promise<void> {
+  const response = await admin.graphql(MUTATION_PRODUCT_DELETE_MEDIA, {
+    variables: { productId, mediaIds },
+  });
+
+  const data = await response.json();
+  const errors = data.data?.productDeleteMedia?.mediaUserErrors;
+  if (errors?.length > 0) {
+    console.error("Media delete errors:", errors);
+  }
+}
+
+/**
+ * Create new media on a product from a source URL.
+ * Returns the new media ID and image URL.
+ */
+export async function createProductMedia(
+  admin: ShopifyAdmin,
+  productId: string,
+  sourceUrl: string,
+  altText: string,
+): Promise<{ mediaId: string | null; imageUrl: string | null }> {
+  const response = await admin.graphql(MUTATION_PRODUCT_CREATE_MEDIA, {
+    variables: {
+      productId,
+      media: [
+        {
+          alt: altText,
+          mediaContentType: "IMAGE",
+          originalSource: sourceUrl,
+        },
+      ],
+    },
+  });
+
+  const data = await response.json();
+  const errors = data.data?.productCreateMedia?.mediaUserErrors;
+
+  if (errors?.length > 0) {
+    const errorMsg = errors.map((e: { message: string }) => e.message).join(", ");
+    throw new Error(`Failed to create product media: ${errorMsg}`);
+  }
+
+  const newMedia = data.data?.productCreateMedia?.media?.[0];
+  return {
+    mediaId: newMedia?.id || null,
+    imageUrl: newMedia?.image?.url || null,
+  };
+}
+
+// ─── Product Parsing Helpers ───────────────────────────────────────────────────
+
+/**
+ * Extract image-type media nodes from a product.
+ */
+export function getProductImages(product: ShopifyProduct): ShopifyMediaImage[] {
+  return (
+    product.media?.edges
+      ?.map((e) => e.node)
+      ?.filter((m) => m.mediaContentType === "IMAGE") || []
+  );
+}
+
+/**
+ * Parse the products array from a Shopify GraphQL response.
+ */
+export function parseProductsResponse(data: Record<string, unknown>): ShopifyProduct[] {
+  const productsData = data as { data?: { products?: { edges?: Array<{ node: ShopifyProduct }> } } };
+  return productsData.data?.products?.edges?.map((e) => e.node) || [];
+}

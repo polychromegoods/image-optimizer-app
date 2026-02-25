@@ -24,167 +24,22 @@ import {
 import { useState, useCallback, useEffect, useRef } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
-import sharp from "sharp";
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-
-function applyTemplate(
-  template: string,
-  variables: Record<string, string>,
-): string {
-  let result = template;
-  for (const [key, value] of Object.entries(variables)) {
-    result = result.replace(new RegExp(`#${key}#`, "g"), value);
-  }
-  result = result.replace(/\s+/g, " ").trim();
-  result = result.replace(/[-_|,]\s*$/, "").trim();
-  return result;
-}
-
-function makeFileName(
-  template: string,
-  variables: Record<string, string>,
-): string {
-  let result = applyTemplate(template, variables);
-  return result
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9-]/g, "")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-async function uploadToShopifyFiles(
-  admin: any,
-  buffer: Buffer,
-  filename: string,
-  mimeType: string,
-): Promise<string> {
-  const stagedUploadResponse = await admin.graphql(
-    `#graphql
-      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-        stagedUploadsCreate(input: $input) {
-          stagedTargets {
-            url
-            resourceUrl
-            parameters { name value }
-          }
-          userErrors { field message }
-        }
-      }
-    `,
-    {
-      variables: {
-        input: [
-          { resource: "FILE", filename, mimeType, httpMethod: "POST" },
-        ],
-      },
-    },
-  );
-
-  const stagedData = await stagedUploadResponse.json();
-  const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
-  if (!target) throw new Error("Failed to create staged upload for backup");
-
-  const uploadFormData = new FormData();
-  for (const param of target.parameters) {
-    uploadFormData.append(param.name, param.value);
-  }
-  uploadFormData.append(
-    "file",
-    new Blob([buffer], { type: mimeType }),
-    filename,
-  );
-
-  const uploadResponse = await fetch(target.url, {
-    method: "POST",
-    body: uploadFormData,
-  });
-  if (!uploadResponse.ok) {
-    throw new Error(`Backup upload failed: ${uploadResponse.statusText}`);
-  }
-
-  await admin.graphql(
-    `#graphql
-      mutation fileCreate($files: [FileCreateInput!]!) {
-        fileCreate(files: $files) {
-          files { ... on MediaImage { id image { url } } }
-          userErrors { field message }
-        }
-      }
-    `,
-    {
-      variables: {
-        files: [
-          {
-            alt: "Backup original image",
-            contentType: "IMAGE",
-            originalSource: target.resourceUrl,
-          },
-        ],
-      },
-    },
-  );
-
-  return target.resourceUrl;
-}
-
-async function uploadWebpForProduct(
-  admin: any,
-  webpBuffer: Buffer,
-  fileName: string,
-): Promise<{ url: string; resourceUrl: string }> {
-  const stagedUploadResponse = await admin.graphql(
-    `#graphql
-      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-        stagedUploadsCreate(input: $input) {
-          stagedTargets {
-            url
-            resourceUrl
-            parameters { name value }
-          }
-          userErrors { field message }
-        }
-      }
-    `,
-    {
-      variables: {
-        input: [
-          {
-            resource: "IMAGE",
-            filename: `${fileName}.webp`,
-            mimeType: "image/webp",
-            httpMethod: "POST",
-          },
-        ],
-      },
-    },
-  );
-
-  const stagedData = await stagedUploadResponse.json();
-  const target = stagedData.data?.stagedUploadsCreate?.stagedTargets?.[0];
-  if (!target) throw new Error("Failed to create staged upload for WebP");
-
-  const uploadFormData = new FormData();
-  for (const param of target.parameters) {
-    uploadFormData.append(param.name, param.value);
-  }
-  uploadFormData.append(
-    "file",
-    new Blob([webpBuffer], { type: "image/webp" }),
-    `${fileName}.webp`,
-  );
-
-  const uploadResponse = await fetch(target.url, {
-    method: "POST",
-    body: uploadFormData,
-  });
-  if (!uploadResponse.ok) {
-    throw new Error(`WebP upload failed: ${uploadResponse.statusText}`);
-  }
-
-  return { url: target.url, resourceUrl: target.resourceUrl };
-}
+import type { LoaderData, StatsMap, ActionResult } from "../lib/types";
+import {
+  QUERY_PRODUCTS_WITH_MEDIA,
+  QUERY_SHOP_NAME,
+  MAX_PRODUCTS_PER_QUERY,
+  RECENT_OPTIMIZATIONS_LIMIT,
+  POLLING_INTERVAL_MS,
+} from "../lib/constants";
+import { extractIdFromGid } from "../lib/templates";
+import { parseProductsResponse, getProductImages } from "../lib/shopify-media";
+import {
+  runOptimizationLoop,
+  revertSingleOptimization,
+  countImagesToProcess,
+} from "../lib/optimization-engine";
 
 // ─── Loader ────────────────────────────────────────────────────────────────────
 
@@ -192,84 +47,37 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const stats = await db.imageOptimization.groupBy({
-    by: ["status"],
-    where: { shop },
-    _count: { status: true },
-  });
+  const [stats, recentOptimizations, seoSettings, activeJob, productsResponse] =
+    await Promise.all([
+      db.imageOptimization.groupBy({
+        by: ["status"],
+        where: { shop },
+        _count: { status: true },
+      }),
+      db.imageOptimization.findMany({
+        where: { shop },
+        orderBy: { updatedAt: "desc" },
+        take: RECENT_OPTIMIZATIONS_LIMIT,
+      }),
+      db.seoSettings.findUnique({ where: { shop } }),
+      db.optimizationJob.findFirst({
+        where: { shop, status: "running" },
+        orderBy: { createdAt: "desc" },
+      }),
+      admin.graphql(QUERY_PRODUCTS_WITH_MEDIA, {
+        variables: { first: MAX_PRODUCTS_PER_QUERY },
+      }),
+    ]);
 
-  const recentOptimizations = await db.imageOptimization.findMany({
-    where: { shop },
-    orderBy: { updatedAt: "desc" },
-    take: 50,
-  });
+  const productsData = await productsResponse.json();
+  const products = parseProductsResponse(productsData);
 
-  const response = await admin.graphql(
-    `#graphql
-      query getProducts($first: Int!) {
-        products(first: $first) {
-          edges {
-            node {
-              id
-              title
-              handle
-              vendor
-              productType
-              media(first: 50) {
-                edges {
-                  node {
-                    ... on MediaImage {
-                      id
-                      image { url altText width height }
-                      mediaContentType
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    `,
-    { variables: { first: 250 } },
-  );
+  const { totalImages, newImages } = await countImagesToProcess(shop, products, null);
 
-  const data = await response.json();
-  const products = data.data?.products?.edges?.map((e: any) => e.node) || [];
-
-  let totalImages = 0;
-  let newImages = 0;
-
-  for (const product of products) {
-    const mediaImages =
-      product.media?.edges
-        ?.map((e: any) => e.node)
-        ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
-
-    totalImages += mediaImages.length;
-
-    for (const media of mediaImages) {
-      const existing = await db.imageOptimization.findUnique({
-        where: { shop_imageId: { shop, imageId: media.id } },
-      });
-      if (!existing || existing.status === "failed") {
-        newImages++;
-      }
-    }
-  }
-
-  const seoSettings = await db.seoSettings.findUnique({ where: { shop } });
-
-  // Check for any running job
-  const activeJob = await db.optimizationJob.findFirst({
-    where: { shop, status: "running" },
-    orderBy: { createdAt: "desc" },
-  });
-
-  return json({
+  return json<LoaderData>({
     shop,
     stats,
-    recentOptimizations,
+    recentOptimizations: recentOptimizations as LoaderData["recentOptimizations"],
     products,
     totalImages,
     newImages,
@@ -284,404 +92,81 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
-  const actionType = formData.get("action");
+  const actionType = formData.get("action") as string;
 
+  // ── Refresh ──
   if (actionType === "refresh") {
-    return json({ success: true, message: "Refreshed" });
+    return json<ActionResult>({ success: true, message: "Refreshed" });
   }
 
-  // ===== CANCEL OPTIMIZATION =====
+  // ── Cancel ──
   if (actionType === "cancel") {
-    const jobId = formData.get("jobId") as string;
-    if (jobId) {
+    const jobId = formData.get("jobId") as string | null;
+    const targetJob = jobId
+      ? await db.optimizationJob.findUnique({ where: { id: jobId } })
+      : await db.optimizationJob.findFirst({
+          where: { shop, status: "running" },
+          orderBy: { createdAt: "desc" },
+        });
+
+    if (targetJob) {
       await db.optimizationJob.update({
-        where: { id: jobId },
+        where: { id: targetJob.id },
         data: { cancelled: true, status: "cancelled" },
       });
-    } else {
-      // Cancel the most recent running job
-      const runningJob = await db.optimizationJob.findFirst({
-        where: { shop, status: "running" },
-        orderBy: { createdAt: "desc" },
-      });
-      if (runningJob) {
-        await db.optimizationJob.update({
-          where: { id: runningJob.id },
-          data: { cancelled: true, status: "cancelled" },
-        });
-      }
     }
-    return json({ success: true, actionType: "cancel" });
+    return json<ActionResult>({ success: true, actionType: "cancel" });
   }
 
-  // ===== OPTIMIZE NEW or RETRY SINGLE =====
+  // ── Optimize New / Retry Single ──
   if (actionType === "optimize_new" || actionType === "retry_single") {
-    const seoSettings = await db.seoSettings.findUnique({
-      where: { shop },
-    });
+    const isRetry = actionType === "retry_single";
+    const targetImageId = isRetry ? (formData.get("imageId") as string) : null;
 
-    const shopResponse = await admin.graphql(
-      `#graphql
-        query { shop { name } }
-      `,
-    );
+    const [seoSettings, shopResponse, productsResponse] = await Promise.all([
+      db.seoSettings.findUnique({ where: { shop } }),
+      admin.graphql(QUERY_SHOP_NAME),
+      admin.graphql(QUERY_PRODUCTS_WITH_MEDIA, {
+        variables: { first: MAX_PRODUCTS_PER_QUERY },
+      }),
+    ]);
+
     const shopData = await shopResponse.json();
-    const shopName = shopData.data?.shop?.name || shop;
+    const shopName = (shopData as { data?: { shop?: { name?: string } } }).data?.shop?.name || shop;
 
-    let targetImageId: string | null = null;
-    if (actionType === "retry_single") {
-      targetImageId = formData.get("imageId") as string;
-    }
+    const productsData = await productsResponse.json();
+    const products = parseProductsResponse(productsData);
 
-    const response = await admin.graphql(
-      `#graphql
-        query getProducts($first: Int!) {
-          products(first: $first) {
-            edges {
-              node {
-                id
-                title
-                handle
-                vendor
-                productType
-                media(first: 50) {
-                  edges {
-                    node {
-                      ... on MediaImage {
-                        id
-                        image { url altText width height }
-                        mediaContentType
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `,
-      { variables: { first: 250 } },
-    );
+    // Count images to process
+    const { imagesToProcess } = await countImagesToProcess(shop, products, targetImageId);
 
-    const data = await response.json();
-    const products =
-      data.data?.products?.edges?.map((e: any) => e.node) || [];
-
-    // Count total images to process
-    let imagesToProcess = 0;
-    for (const product of products) {
-      const mediaImages =
-        product.media?.edges
-          ?.map((e: any) => e.node)
-          ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
-      for (const media of mediaImages) {
-        if (targetImageId && media.id !== targetImageId) continue;
-        const existing = await db.imageOptimization.findUnique({
-          where: { shop_imageId: { shop, imageId: media.id } },
-        });
-        if (
-          actionType === "optimize_new" &&
-          existing &&
-          existing.status === "completed"
-        ) {
-          continue;
-        }
-        imagesToProcess++;
-      }
-    }
-
-    // Create a job record for tracking progress
+    // Create job record
     const job = await db.optimizationJob.create({
-      data: {
-        shop,
-        status: "running",
-        totalImages: imagesToProcess,
-      },
+      data: { shop, status: "running", totalImages: imagesToProcess },
     });
 
-    let processedCount = 0;
-    let errorCount = 0;
-    let skippedCount = 0;
-    let totalSaved = 0;
+    // Run the optimization loop
+    const result = await runOptimizationLoop({
+      admin,
+      shop,
+      products,
+      shopName,
+      seoSettings,
+      jobId: job.id,
+      targetImageId,
+      isRetry,
+    });
 
-    for (const product of products) {
-      const productId = product.id;
-      const mediaImages =
-        product.media?.edges
-          ?.map((e: any) => e.node)
-          ?.filter((m: any) => m.mediaContentType === "IMAGE") || [];
-
-      for (let i = 0; i < mediaImages.length; i++) {
-        const media = mediaImages[i];
-
-        if (targetImageId && media.id !== targetImageId) continue;
-
-        // ── Check for cancellation before each image ──
-        const currentJob = await db.optimizationJob.findUnique({
-          where: { id: job.id },
-        });
-        if (currentJob?.cancelled) {
-          // Update job as cancelled and return early
-          await db.optimizationJob.update({
-            where: { id: job.id },
-            data: {
-              status: "cancelled",
-              processedCount,
-              errorCount,
-              skippedCount,
-              totalSaved,
-              currentImage: null,
-            },
-          });
-          return json({
-            success: true,
-            actionType: "cancelled",
-            processedCount,
-            errorCount,
-            skippedCount,
-            totalSaved,
-            jobId: job.id,
-          });
-        }
-
-        try {
-          const existing = await db.imageOptimization.findUnique({
-            where: { shop_imageId: { shop, imageId: media.id } },
-          });
-
-          if (
-            actionType === "optimize_new" &&
-            existing &&
-            existing.status === "completed"
-          ) {
-            skippedCount++;
-            // Update job progress
-            await db.optimizationJob.update({
-              where: { id: job.id },
-              data: { skippedCount },
-            });
-            continue;
-          }
-
-          // Update job with current image name
-          const productName = product.title || "Unknown";
-          await db.optimizationJob.update({
-            where: { id: job.id },
-            data: {
-              currentImage: `${productName} (image ${i + 1})`,
-              processedCount,
-              errorCount,
-              skippedCount,
-              totalSaved,
-            },
-          });
-
-          await db.imageOptimization.upsert({
-            where: { shop_imageId: { shop, imageId: media.id } },
-            create: {
-              shop,
-              productId,
-              imageId: media.id,
-              originalUrl: media.image.url,
-              originalGid: media.id,
-              originalAlt: media.image.altText || "",
-              status: "processing",
-            },
-            update: {
-              status: "processing",
-              originalAlt: media.image.altText || "",
-            },
-          });
-
-          const templateVars = {
-            product_name: product.title || "",
-            vendor: product.vendor || "",
-            product_type: product.productType || "",
-            shop_name: shopName,
-            product_handle: product.handle || "",
-            variant_title: "",
-            image_number: String(i + 1),
-          };
-
-          let altText = media.image.altText || product.title || "";
-          let fileName = `optimized-${media.id.split("/").pop()}`;
-
-          if (seoSettings && seoSettings.autoApplyOnOptimize) {
-            if (seoSettings.altTextTemplate) {
-              altText = applyTemplate(
-                seoSettings.altTextTemplate,
-                templateVars,
-              );
-            }
-            if (seoSettings.fileNameTemplate) {
-              fileName = makeFileName(
-                seoSettings.fileNameTemplate,
-                templateVars,
-              );
-            }
-          }
-
-          // Step 1: Fetch the original image
-          const imageResponse = await fetch(media.image.url);
-          const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-          const originalSize = imageBuffer.length;
-
-          // Step 2: BACKUP - Upload original to Shopify Files
-          const originalExtension =
-            media.image.url.split("?")[0].split(".").pop() || "png";
-          const backupFilename = `backup-${media.id.split("/").pop()}.${originalExtension}`;
-          const backupMimeType =
-            originalExtension === "jpg" || originalExtension === "jpeg"
-              ? "image/jpeg"
-              : originalExtension === "webp"
-                ? "image/webp"
-                : "image/png";
-
-          let backupUrl: string;
-          try {
-            backupUrl = await uploadToShopifyFiles(
-              admin,
-              imageBuffer,
-              backupFilename,
-              backupMimeType,
-            );
-          } catch (backupError) {
-            console.error(
-              "Backup upload failed, skipping image:",
-              backupError,
-            );
-            throw new Error(
-              `Backup failed for image ${media.id}: ${backupError}`,
-            );
-          }
-
-          // Step 3: Convert to WebP
-          const webpBuffer = await sharp(imageBuffer)
-            .webp({ quality: 85 })
-            .toBuffer();
-          const webpSize = webpBuffer.length;
-
-          // Step 4: Upload WebP for product media
-          const { resourceUrl: webpResourceUrl } =
-            await uploadWebpForProduct(admin, webpBuffer, fileName);
-
-          // Step 5: Delete original product media
-          const deleteResponse = await admin.graphql(
-            `#graphql
-              mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
-                productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
-                  deletedMediaIds
-                  mediaUserErrors { field message }
-                }
-              }
-            `,
-            {
-              variables: { productId, mediaIds: [media.id] },
-            },
-          );
-          const deleteData = await deleteResponse.json();
-          if (
-            deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0
-          ) {
-            console.error(
-              "Delete errors:",
-              deleteData.data.productDeleteMedia.mediaUserErrors,
-            );
-          }
-
-          // Step 6: Create new product media with WebP
-          const createMediaResponse = await admin.graphql(
-            `#graphql
-              mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-                productCreateMedia(media: $media, productId: $productId) {
-                  media {
-                    ... on MediaImage { id image { url } }
-                  }
-                  mediaUserErrors { field message }
-                }
-              }
-            `,
-            {
-              variables: {
-                productId,
-                media: [
-                  {
-                    alt: altText,
-                    mediaContentType: "IMAGE",
-                    originalSource: webpResourceUrl,
-                  },
-                ],
-              },
-            },
-          );
-
-          const createData = await createMediaResponse.json();
-          const newMedia =
-            createData.data?.productCreateMedia?.media?.[0];
-
-          if (
-            createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
-          ) {
-            throw new Error(
-              createData.data.productCreateMedia.mediaUserErrors
-                .map((e: any) => e.message)
-                .join(", "),
-            );
-          }
-
-          const savings = originalSize - webpSize;
-          totalSaved += savings;
-
-          await db.imageOptimization.update({
-            where: { shop_imageId: { shop, imageId: media.id } },
-            data: {
-              webpUrl: newMedia?.image?.url || webpResourceUrl,
-              webpGid: newMedia?.id || null,
-              backupUrl: backupUrl,
-              fileSize: originalSize,
-              webpFileSize: webpSize,
-              status: "completed",
-              altTextUpdated: seoSettings?.autoApplyOnOptimize
-                ? true
-                : false,
-            },
-          });
-
-          processedCount++;
-
-          // Update job progress after each successful image
-          await db.optimizationJob.update({
-            where: { id: job.id },
-            data: {
-              processedCount,
-              errorCount,
-              totalSaved,
-            },
-          });
-        } catch (error) {
-          console.error(`Error processing image ${media.id}:`, error);
-          errorCount++;
-
-          await db.imageOptimization.upsert({
-            where: { shop_imageId: { shop, imageId: media.id } },
-            create: {
-              shop,
-              productId,
-              imageId: media.id,
-              originalUrl: media.image?.url || "",
-              originalGid: media.id,
-              originalAlt: media.image?.altText || "",
-              status: "failed",
-            },
-            update: { status: "failed" },
-          });
-
-          await db.optimizationJob.update({
-            where: { id: job.id },
-            data: { errorCount },
-          });
-        }
-      }
+    if (result.cancelled) {
+      return json<ActionResult>({
+        success: true,
+        actionType: "cancelled",
+        processedCount: result.processedCount,
+        errorCount: result.errorCount,
+        skippedCount: result.skippedCount,
+        totalSaved: result.totalSaved,
+        jobId: job.id,
+      });
     }
 
     // Mark job as completed
@@ -689,26 +174,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { id: job.id },
       data: {
         status: "completed",
-        processedCount,
-        errorCount,
-        skippedCount,
-        totalSaved,
+        processedCount: result.processedCount,
+        errorCount: result.errorCount,
+        skippedCount: result.skippedCount,
+        totalSaved: result.totalSaved,
         currentImage: null,
       },
     });
 
-    return json({
+    return json<ActionResult>({
       success: true,
-      actionType: actionType === "retry_single" ? "retry" : "optimize",
-      processedCount,
-      errorCount,
-      skippedCount,
-      totalSaved,
+      actionType: isRetry ? "retry" : "optimize",
+      processedCount: result.processedCount,
+      errorCount: result.errorCount,
+      skippedCount: result.skippedCount,
+      totalSaved: result.totalSaved,
       jobId: job.id,
     });
   }
 
-  // ===== REVERT ALL =====
+  // ── Revert All ──
   if (actionType === "revert_all") {
     const optimizations = await db.imageOptimization.findMany({
       where: { shop, status: "completed" },
@@ -719,74 +204,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
-        const restoreSource = opt.backupUrl || opt.originalUrl;
-
-        if (opt.webpGid) {
-          const deleteResp = await admin.graphql(
-            `#graphql
-              mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
-                productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
-                  deletedMediaIds
-                  mediaUserErrors { field message }
-                }
-              }
-            `,
-            {
-              variables: {
-                productId: opt.productId,
-                mediaIds: [opt.webpGid],
-              },
-            },
-          );
-          const deleteData = await deleteResp.json();
-          if (
-            deleteData.data?.productDeleteMedia?.mediaUserErrors?.length > 0
-          ) {
-            console.error(
-              "Delete errors during revert:",
-              deleteData.data.productDeleteMedia.mediaUserErrors,
-            );
-          }
-        }
-
-        const createResp = await admin.graphql(
-          `#graphql
-            mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-              productCreateMedia(media: $media, productId: $productId) {
-                media { ... on MediaImage { id image { url } } }
-                mediaUserErrors { field message }
-              }
-            }
-          `,
-          {
-            variables: {
-              productId: opt.productId,
-              media: [
-                {
-                  alt: opt.originalAlt || "",
-                  mediaContentType: "IMAGE",
-                  originalSource: restoreSource,
-                },
-              ],
-            },
-          },
-        );
-
-        const createData = await createResp.json();
-        if (
-          createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
-        ) {
-          const errors = createData.data.productCreateMedia.mediaUserErrors
-            .map((e: any) => e.message)
-            .join(", ");
-          throw new Error(`Failed to create media: ${errors}`);
-        }
-
-        await db.imageOptimization.update({
-          where: { id: opt.id },
-          data: { status: "reverted", altTextUpdated: false },
-        });
-
+        await revertSingleOptimization(admin, opt);
         revertedCount++;
       } catch (error) {
         console.error(`Error reverting image ${opt.imageId}:`, error);
@@ -794,7 +212,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
     }
 
-    return json({
+    return json<ActionResult>({
       success: true,
       actionType: "revert",
       revertedCount,
@@ -802,7 +220,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
-  // ===== REVERT SINGLE =====
+  // ── Revert Single ──
   if (actionType === "revert_single") {
     const optimizationId = formData.get("optimizationId") as string;
 
@@ -812,86 +230,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
 
       if (!opt || opt.status !== "completed") {
-        return json({
+        return json<ActionResult>({
           success: false,
           message: "Optimization not found or not completed",
         });
       }
 
-      const restoreSource = opt.backupUrl || opt.originalUrl;
-
-      if (opt.webpGid) {
-        await admin.graphql(
-          `#graphql
-            mutation productDeleteMedia($mediaIds: [ID!]!, $productId: ID!) {
-              productDeleteMedia(mediaIds: $mediaIds, productId: $productId) {
-                deletedMediaIds
-                mediaUserErrors { field message }
-              }
-            }
-          `,
-          {
-            variables: {
-              productId: opt.productId,
-              mediaIds: [opt.webpGid],
-            },
-          },
-        );
-      }
-
-      const createResp = await admin.graphql(
-        `#graphql
-          mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-            productCreateMedia(media: $media, productId: $productId) {
-              media { ... on MediaImage { id image { url } } }
-              mediaUserErrors { field message }
-            }
-          }
-        `,
-        {
-          variables: {
-            productId: opt.productId,
-            media: [
-              {
-                alt: opt.originalAlt || "",
-                mediaContentType: "IMAGE",
-                originalSource: restoreSource,
-              },
-            ],
-          },
-        },
-      );
-
-      const createData = await createResp.json();
-      if (
-        createData.data?.productCreateMedia?.mediaUserErrors?.length > 0
-      ) {
-        const errors = createData.data.productCreateMedia.mediaUserErrors
-          .map((e: any) => e.message)
-          .join(", ");
-        throw new Error(`Failed to create media: ${errors}`);
-      }
-
-      await db.imageOptimization.update({
-        where: { id: opt.id },
-        data: { status: "reverted", altTextUpdated: false },
-      });
-
-      return json({ success: true, actionType: "revert_single" });
+      await revertSingleOptimization(admin, opt);
+      return json<ActionResult>({ success: true, actionType: "revert_single" });
     } catch (error) {
       console.error("Error reverting single image:", error);
-      return json({ success: false, message: "Failed to revert image" });
+      return json<ActionResult>({ success: false, message: "Failed to revert image" });
     }
   }
 
-  return json({ success: false });
+  return json<ActionResult>({ success: false });
 };
 
 // ─── Component ─────────────────────────────────────────────────────────────────
 
 export default function ImageOptimizer() {
   const {
-    shop,
     stats: initialStats,
     recentOptimizations: initialOptimizations,
     products,
@@ -900,19 +259,19 @@ export default function ImageOptimizer() {
     seoSettings,
     activeJob: initialActiveJob,
   } = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
+  const actionData = useActionData<typeof action>() as ActionResult | undefined;
   const submit = useSubmit();
   const navigation = useNavigation();
 
   const [showRevertModal, setShowRevertModal] = useState(false);
-  const [compareImage, setCompareImage] = useState<any>(null);
+  const [compareImage, setCompareImage] = useState<Record<string, unknown> | null>(null);
 
   // Live progress state
-  const [liveJob, setLiveJob] = useState<any>(initialActiveJob);
-  const [liveStats, setLiveStats] = useState<any>(initialStats);
-  const [liveOptimizations, setLiveOptimizations] = useState<any>(
-    initialOptimizations,
+  const [liveJob, setLiveJob] = useState<Record<string, unknown> | null>(
+    initialActiveJob as Record<string, unknown> | null,
   );
+  const [liveStats, setLiveStats] = useState(initialStats);
+  const [liveOptimizations, setLiveOptimizations] = useState(initialOptimizations);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isSubmitting = navigation.state === "submitting";
@@ -920,18 +279,17 @@ export default function ImageOptimizer() {
 
   const isOptimizing =
     (isSubmitting && submittingAction === "optimize_new") ||
-    liveJob?.status === "running";
+    (liveJob as Record<string, unknown> | null)?.status === "running";
   const isRefreshing = isSubmitting && submittingAction === "refresh";
   const isReverting =
     isSubmitting &&
-    (submittingAction === "revert_all" ||
-      submittingAction === "revert_single");
+    (submittingAction === "revert_all" || submittingAction === "revert_single");
   const isRetrying = isSubmitting && submittingAction === "retry_single";
   const isCancelling = isSubmitting && submittingAction === "cancel";
 
   // ── Polling for live updates during optimization ──
   useEffect(() => {
-    const shouldPoll = liveJob?.status === "running" || isOptimizing;
+    const shouldPoll = (liveJob as Record<string, unknown> | null)?.status === "running" || isOptimizing;
 
     if (shouldPoll && !pollingRef.current) {
       pollingRef.current = setInterval(async () => {
@@ -944,14 +302,9 @@ export default function ImageOptimizer() {
             if (data.hasJob) {
               setLiveJob(data.job);
               if (data.stats) setLiveStats(data.stats);
-              if (data.recentOptimizations)
-                setLiveOptimizations(data.recentOptimizations);
+              if (data.recentOptimizations) setLiveOptimizations(data.recentOptimizations);
 
-              // Stop polling if job is done
-              if (
-                data.job.status === "completed" ||
-                data.job.status === "cancelled"
-              ) {
+              if (data.job.status === "completed" || data.job.status === "cancelled") {
                 if (pollingRef.current) {
                   clearInterval(pollingRef.current);
                   pollingRef.current = null;
@@ -962,126 +315,105 @@ export default function ImageOptimizer() {
         } catch (e) {
           console.error("Polling error:", e);
         }
-      }, 2000);
+      }, POLLING_INTERVAL_MS);
     }
 
     return () => {
-      if (pollingRef.current && !isOptimizing && liveJob?.status !== "running") {
+      if (pollingRef.current && !isOptimizing && (liveJob as Record<string, unknown> | null)?.status !== "running") {
         clearInterval(pollingRef.current);
         pollingRef.current = null;
       }
     };
-  }, [isOptimizing, liveJob?.status]);
+  }, [isOptimizing, (liveJob as Record<string, unknown> | null)?.status]);
 
-  // Reset live state when loader data changes (e.g., after form submission completes)
+  // Sync loader data into live state
   useEffect(() => {
     setLiveStats(initialStats);
     setLiveOptimizations(initialOptimizations);
     if (initialActiveJob) {
-      setLiveJob(initialActiveJob);
-    } else if (
-      liveJob?.status === "completed" ||
-      liveJob?.status === "cancelled"
-    ) {
-      // Keep the finished job visible for the banner
+      setLiveJob(initialActiveJob as Record<string, unknown>);
     }
   }, [initialStats, initialOptimizations, initialActiveJob]);
 
-  // Start polling when optimization begins
+  // Trigger polling when optimization form is submitted
   useEffect(() => {
-    if (
-      isSubmitting &&
-      submittingAction === "optimize_new" &&
-      !pollingRef.current
-    ) {
-      // Small delay to let the job be created
-      const timeout = setTimeout(() => {
-        setLiveJob({ status: "running" });
-      }, 500);
+    if (isSubmitting && submittingAction === "optimize_new" && !pollingRef.current) {
+      const timeout = setTimeout(() => setLiveJob({ status: "running" }), 500);
       return () => clearTimeout(timeout);
     }
   }, [isSubmitting, submittingAction]);
 
-  // Use live data when available
+  // Derived state
   const stats = liveStats || initialStats;
   const recentOptimizations = liveOptimizations || initialOptimizations;
 
-  const statsMap = (Array.isArray(stats) ? stats : []).reduce(
-    (acc: any, stat: any) => {
+  const statsMap: StatsMap = (Array.isArray(stats) ? stats : []).reduce(
+    (acc: StatsMap, stat: { status: string; _count: { status: number } }) => {
       acc[stat.status] = stat._count.status;
       return acc;
     },
-    {
-      pending: 0,
-      processing: 0,
-      completed: 0,
-      failed: 0,
-      reverted: 0,
-    },
+    { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
   );
 
-  const completionPercentage =
-    totalImages > 0 ? (statsMap.completed / totalImages) * 100 : 0;
+  const completionPercentage = totalImages > 0 ? (statsMap.completed / totalImages) * 100 : 0;
 
-  // Job progress percentage
+  const job = liveJob as Record<string, number | string | null> | null;
   const jobProgress =
-    liveJob?.totalImages > 0
-      ? ((liveJob.processedCount + liveJob.errorCount + liveJob.skippedCount) /
-          liveJob.totalImages) *
+    job && (job.totalImages as number) > 0
+      ? (((job.processedCount as number) + (job.errorCount as number) + (job.skippedCount as number)) /
+          (job.totalImages as number)) *
         100
       : 0;
 
+  // ── Handlers ──
+
   const handleOptimizeNew = () => {
-    const formData = new FormData();
-    formData.append("action", "optimize_new");
-    submit(formData, { method: "post" });
+    const fd = new FormData();
+    fd.append("action", "optimize_new");
+    submit(fd, { method: "post" });
   };
 
   const handleRefresh = () => {
-    const formData = new FormData();
-    formData.append("action", "refresh");
-    submit(formData, { method: "post", replace: true });
+    const fd = new FormData();
+    fd.append("action", "refresh");
+    submit(fd, { method: "post", replace: true });
   };
 
   const handleRevertAll = useCallback(() => {
-    const formData = new FormData();
-    formData.append("action", "revert_all");
-    submit(formData, { method: "post" });
+    const fd = new FormData();
+    fd.append("action", "revert_all");
+    submit(fd, { method: "post" });
     setShowRevertModal(false);
   }, [submit]);
 
   const handleRevertSingle = (optimizationId: string) => {
-    const formData = new FormData();
-    formData.append("action", "revert_single");
-    formData.append("optimizationId", optimizationId);
-    submit(formData, { method: "post" });
+    const fd = new FormData();
+    fd.append("action", "revert_single");
+    fd.append("optimizationId", optimizationId);
+    submit(fd, { method: "post" });
   };
 
   const handleRetrySingle = (imageId: string) => {
-    const formData = new FormData();
-    formData.append("action", "retry_single");
-    formData.append("imageId", imageId);
-    submit(formData, { method: "post" });
+    const fd = new FormData();
+    fd.append("action", "retry_single");
+    fd.append("imageId", imageId);
+    submit(fd, { method: "post" });
   };
 
   const handleCancel = () => {
-    const formData = new FormData();
-    formData.append("action", "cancel");
-    if (liveJob?.id) {
-      formData.append("jobId", liveJob.id);
-    }
-    submit(formData, { method: "post" });
+    const fd = new FormData();
+    fd.append("action", "cancel");
+    if (job?.id) fd.append("jobId", job.id as string);
+    submit(fd, { method: "post" });
   };
 
-  const handleCompare = (opt: any) => {
-    setCompareImage(opt);
-  };
-
-  // Build a product lookup map
+  // Product name lookup
   const productMap: Record<string, string> = {};
   for (const p of products) {
     productMap[p.id] = p.title;
   }
+
+  // ── Render ──
 
   return (
     <Page
@@ -1092,143 +424,36 @@ export default function ImageOptimizer() {
         <Layout.Section>
           <BlockStack gap="500">
             {/* Result banners */}
-            {actionData?.actionType === "optimize" && !isOptimizing && (
-              <Banner
-                tone={actionData.errorCount > 0 ? "warning" : "success"}
-                title="Optimization Complete"
-              >
-                <p>
-                  Processed: {actionData.processedCount} | Skipped:{" "}
-                  {actionData.skippedCount} | Errors: {actionData.errorCount}
-                  {actionData.totalSaved > 0 &&
-                    ` | Total saved: ${(actionData.totalSaved / 1024).toFixed(1)} KB`}
-                </p>
-              </Banner>
-            )}
-
-            {actionData?.actionType === "cancelled" && (
-              <Banner tone="warning" title="Optimization Cancelled">
-                <p>
-                  Stopped after processing {actionData.processedCount} image
-                  {actionData.processedCount !== 1 ? "s" : ""}.
-                  {actionData.errorCount > 0 &&
-                    ` ${actionData.errorCount} error(s).`}
-                  {actionData.totalSaved > 0 &&
-                    ` Saved ${(actionData.totalSaved / 1024).toFixed(1)} KB so far.`}
-                </p>
-              </Banner>
-            )}
-
-            {actionData?.actionType === "retry" && (
-              <Banner
-                tone={actionData.errorCount > 0 ? "warning" : "success"}
-                title="Retry Complete"
-              >
-                <p>
-                  Processed: {actionData.processedCount} | Errors:{" "}
-                  {actionData.errorCount}
-                </p>
-              </Banner>
-            )}
-
-            {actionData?.actionType === "revert" && (
-              <Banner
-                tone={
-                  actionData.errorCount > 0
-                    ? actionData.revertedCount > 0
-                      ? "warning"
-                      : "critical"
-                    : "success"
-                }
-                title="Revert Complete"
-              >
-                <p>
-                  Reverted {actionData.revertedCount} image
-                  {actionData.revertedCount !== 1 ? "s" : ""} back to
-                  originals.
-                  {actionData.errorCount > 0 &&
-                    ` ${actionData.errorCount} error(s) occurred.`}
-                </p>
-              </Banner>
-            )}
+            <ResultBanners actionData={actionData} isOptimizing={isOptimizing} statsMap={statsMap} />
 
             {seoSettings?.autoApplyOnOptimize && (
               <Banner tone="info">
                 <p>
-                  SEO alt text and filenames will be applied automatically
-                  during optimization.
+                  SEO alt text and filenames will be applied automatically during optimization.
                   <a href="/app/settings"> Edit templates</a>
                 </p>
               </Banner>
             )}
 
-            {/* Live progress card - shown during optimization */}
-            {isOptimizing && liveJob && (
-              <Card>
-                <BlockStack gap="400">
-                  <InlineStack align="space-between" blockAlign="center">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Spinner size="small" />
-                      <Text as="h2" variant="headingMd">
-                        Optimizing Images...
-                      </Text>
-                    </InlineStack>
-                    <Button
-                      tone="critical"
-                      onClick={handleCancel}
-                      loading={isCancelling}
-                    >
-                      Cancel
-                    </Button>
-                  </InlineStack>
-
-                  <ProgressBar
-                    progress={Math.min(jobProgress, 100)}
-                    size="small"
-                    tone="primary"
-                  />
-
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodySm">
-                      {liveJob.processedCount || 0} of{" "}
-                      {liveJob.totalImages || "?"} images processed
-                      {(liveJob.errorCount || 0) > 0 &&
-                        ` | ${liveJob.errorCount} error(s)`}
-                      {(liveJob.skippedCount || 0) > 0 &&
-                        ` | ${liveJob.skippedCount} skipped`}
-                    </Text>
-                    {liveJob.currentImage && (
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Currently processing: {liveJob.currentImage}
-                      </Text>
-                    )}
-                    {(liveJob.totalSaved || 0) > 0 && (
-                      <Text as="p" variant="bodySm" tone="success">
-                        Saved so far:{" "}
-                        {((liveJob.totalSaved || 0) / 1024).toFixed(1)} KB
-                      </Text>
-                    )}
-                  </BlockStack>
-                </BlockStack>
-              </Card>
+            {/* Live progress card */}
+            {isOptimizing && job && (
+              <LiveProgressCard
+                job={job}
+                jobProgress={jobProgress}
+                onCancel={handleCancel}
+                isCancelling={isCancelling}
+              />
             )}
 
-            {/* Refresh card */}
+            {/* Sync card */}
             <Card>
               <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">
-                  Sync Images
-                </Text>
+                <Text as="h2" variant="headingMd">Sync Images</Text>
                 <Text as="p" tone="subdued">
-                  If you uploaded new product images, click refresh to detect
-                  them.
+                  If you uploaded new product images, click refresh to detect them.
                 </Text>
                 <div>
-                  <Button
-                    onClick={handleRefresh}
-                    loading={isRefreshing}
-                    disabled={isOptimizing}
-                  >
+                  <Button onClick={handleRefresh} loading={isRefreshing} disabled={isOptimizing}>
                     Refresh
                   </Button>
                 </div>
@@ -1238,25 +463,22 @@ export default function ImageOptimizer() {
             {newImages > 0 && !isOptimizing && (
               <Banner tone="info">
                 <p>
-                  Found {newImages} new image{newImages !== 1 ? "s" : ""}{" "}
-                  ready to optimize.
+                  Found {newImages} new image{newImages !== 1 ? "s" : ""} ready to optimize.
                 </p>
               </Banner>
             )}
 
-            {/* Optimize card - hidden during active optimization to avoid duplicate progress bars */}
+            {/* Optimization progress card (hidden during active optimization) */}
             {!isOptimizing && (
               <Card>
                 <BlockStack gap="400">
-                  <Text as="h2" variant="headingMd">
-                    Optimization Progress
-                  </Text>
+                  <Text as="h2" variant="headingMd">Optimization Progress</Text>
                   <ProgressBar progress={completionPercentage} size="small" />
                   <BlockStack gap="200">
                     <Text as="p">Total images: {totalImages}</Text>
                     <Text as="p">
-                      Optimized: {statsMap.completed} | Failed:{" "}
-                      {statsMap.failed} | Reverted: {statsMap.reverted || 0}
+                      Optimized: {statsMap.completed} | Failed: {statsMap.failed} | Reverted:{" "}
+                      {statsMap.reverted || 0}
                     </Text>
                   </BlockStack>
                   <InlineStack gap="300">
@@ -1284,223 +506,16 @@ export default function ImageOptimizer() {
               </Card>
             )}
 
-            {/* Recent optimizations with thumbnails */}
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Recent Optimizations
-                </Text>
-                {recentOptimizations.length > 0 ? (
-                  <div style={{ overflowX: "auto" }}>
-                    <table
-                      style={{
-                        width: "100%",
-                        borderCollapse: "collapse",
-                        fontSize: "14px",
-                      }}
-                    >
-                      <thead>
-                        <tr
-                          style={{
-                            borderBottom: "1px solid #e1e3e5",
-                            textAlign: "left",
-                          }}
-                        >
-                          <th style={{ padding: "12px 8px" }}>Preview</th>
-                          <th style={{ padding: "12px 8px" }}>Product</th>
-                          <th style={{ padding: "12px 8px" }}>Status</th>
-                          <th style={{ padding: "12px 8px" }}>Original</th>
-                          <th style={{ padding: "12px 8px" }}>WebP</th>
-                          <th style={{ padding: "12px 8px" }}>Savings</th>
-                          <th style={{ padding: "12px 8px" }}>Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {recentOptimizations.map((opt: any) => {
-                          const thumbUrl = opt.webpUrl || opt.originalUrl;
-                          const productName =
-                            productMap[opt.productId] ||
-                            opt.productId.split("/").pop();
-
-                          return (
-                            <tr
-                              key={opt.id}
-                              style={{
-                                borderBottom: "1px solid #f1f2f3",
-                              }}
-                            >
-                              {/* Thumbnail */}
-                              <td style={{ padding: "8px" }}>
-                                {thumbUrl ? (
-                                  <div
-                                    onClick={() =>
-                                      opt.status === "completed" &&
-                                      handleCompare(opt)
-                                    }
-                                    style={{
-                                      cursor:
-                                        opt.status === "completed"
-                                          ? "pointer"
-                                          : "default",
-                                    }}
-                                    title={
-                                      opt.status === "completed"
-                                        ? "Click to compare original vs WebP"
-                                        : ""
-                                    }
-                                  >
-                                    <Thumbnail
-                                      source={thumbUrl}
-                                      alt={`Image ${opt.imageId.split("/").pop()}`}
-                                      size="small"
-                                    />
-                                  </div>
-                                ) : (
-                                  <div
-                                    style={{
-                                      width: 40,
-                                      height: 40,
-                                      backgroundColor: "#f1f2f3",
-                                      borderRadius: 4,
-                                      display: "flex",
-                                      alignItems: "center",
-                                      justifyContent: "center",
-                                      fontSize: "10px",
-                                      color: "#8c9196",
-                                    }}
-                                  >
-                                    N/A
-                                  </div>
-                                )}
-                              </td>
-
-                              {/* Product name */}
-                              <td style={{ padding: "8px" }}>
-                                <Text
-                                  as="span"
-                                  variant="bodyMd"
-                                  fontWeight="semibold"
-                                >
-                                  {productName}
-                                </Text>
-                              </td>
-
-                              {/* Status badge */}
-                              <td style={{ padding: "8px" }}>
-                                <Badge
-                                  tone={
-                                    opt.status === "completed"
-                                      ? "success"
-                                      : opt.status === "failed"
-                                        ? "critical"
-                                        : opt.status === "processing"
-                                          ? "attention"
-                                          : opt.status === "reverted"
-                                            ? "warning"
-                                            : "info"
-                                  }
-                                >
-                                  {opt.status === "processing" ? (
-                                    <InlineStack
-                                      gap="100"
-                                      blockAlign="center"
-                                    >
-                                      <span>processing</span>
-                                    </InlineStack>
-                                  ) : (
-                                    opt.status
-                                  )}
-                                </Badge>
-                              </td>
-
-                              {/* Original size */}
-                              <td style={{ padding: "8px" }}>
-                                {opt.fileSize
-                                  ? `${(opt.fileSize / 1024).toFixed(1)} KB`
-                                  : "-"}
-                              </td>
-
-                              {/* WebP size */}
-                              <td style={{ padding: "8px" }}>
-                                {opt.webpFileSize
-                                  ? `${(opt.webpFileSize / 1024).toFixed(1)} KB`
-                                  : "-"}
-                              </td>
-
-                              {/* Savings */}
-                              <td style={{ padding: "8px" }}>
-                                {opt.webpFileSize && opt.fileSize ? (
-                                  <span
-                                    style={{
-                                      color: "#008060",
-                                      fontWeight: 600,
-                                    }}
-                                  >
-                                    {(
-                                      ((opt.fileSize - opt.webpFileSize) /
-                                        opt.fileSize) *
-                                      100
-                                    ).toFixed(1)}
-                                    %
-                                  </span>
-                                ) : (
-                                  "-"
-                                )}
-                              </td>
-
-                              {/* Actions */}
-                              <td style={{ padding: "8px" }}>
-                                <InlineStack gap="200">
-                                  {opt.status === "completed" && (
-                                    <>
-                                      <Button
-                                        size="slim"
-                                        onClick={() =>
-                                          handleCompare(opt)
-                                        }
-                                      >
-                                        Compare
-                                      </Button>
-                                      <Button
-                                        size="slim"
-                                        tone="critical"
-                                        onClick={() =>
-                                          handleRevertSingle(opt.id)
-                                        }
-                                        loading={isReverting}
-                                      >
-                                        Revert
-                                      </Button>
-                                    </>
-                                  )}
-                                  {opt.status === "failed" && (
-                                    <Button
-                                      size="slim"
-                                      variant="primary"
-                                      onClick={() =>
-                                        handleRetrySingle(opt.imageId)
-                                      }
-                                      loading={isRetrying}
-                                    >
-                                      Retry
-                                    </Button>
-                                  )}
-                                </InlineStack>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <Text as="p" tone="subdued">
-                    No optimizations yet. Click Refresh, then Optimize to
-                    start.
-                  </Text>
-                )}
-              </BlockStack>
-            </Card>
+            {/* Recent optimizations table */}
+            <OptimizationsTable
+              optimizations={recentOptimizations}
+              productMap={productMap}
+              isReverting={isReverting}
+              isRetrying={isRetrying}
+              onCompare={setCompareImage}
+              onRevert={handleRevertSingle}
+              onRetry={handleRetrySingle}
+            />
           </BlockStack>
         </Layout.Section>
       </Layout>
@@ -1511,135 +526,403 @@ export default function ImageOptimizer() {
           open={showRevertModal}
           onClose={() => setShowRevertModal(false)}
           title="Revert All Images?"
-          primaryAction={{
-            content: "Revert All",
-            destructive: true,
-            onAction: handleRevertAll,
-          }}
-          secondaryActions={[
-            {
-              content: "Cancel",
-              onAction: () => setShowRevertModal(false),
-            },
-          ]}
+          primaryAction={{ content: "Revert All", destructive: true, onAction: handleRevertAll }}
+          secondaryActions={[{ content: "Cancel", onAction: () => setShowRevertModal(false) }]}
         >
           <Modal.Section>
             <Text as="p">
-              This will restore all {statsMap.completed} optimized images
-              back to their originals using the backed-up copies. Your WebP
-              versions will be removed from the products.
+              This will restore all {statsMap.completed} optimized images back to their originals
+              using the backed-up copies. Your WebP versions will be removed from the products.
             </Text>
           </Modal.Section>
         </Modal>
       )}
 
-      {/* Compare modal - Original vs WebP side by side */}
+      {/* Compare modal */}
       {compareImage && (
-        <Modal
-          open={!!compareImage}
-          onClose={() => setCompareImage(null)}
-          title="Compare: Original vs WebP"
-          large
-          secondaryActions={[
-            {
-              content: "Close",
-              onAction: () => setCompareImage(null),
-            },
-          ]}
-        >
-          <Modal.Section>
-            <div
-              style={{
-                display: "flex",
-                gap: "24px",
-                flexWrap: "wrap",
-              }}
-            >
-              {/* Original */}
-              <div style={{ flex: 1, minWidth: "250px" }}>
-                <BlockStack gap="300">
-                  <InlineStack align="center" gap="200">
-                    <Badge tone="warning">Original</Badge>
-                    <Text as="span" variant="bodySm" tone="subdued">
-                      {compareImage.fileSize
-                        ? `${(compareImage.fileSize / 1024).toFixed(1)} KB`
-                        : ""}
-                    </Text>
-                  </InlineStack>
-                  <div
-                    style={{
-                      border: "1px solid #e1e3e5",
-                      borderRadius: "8px",
-                      overflow: "hidden",
-                      backgroundColor: "#fafafa",
-                    }}
-                  >
-                    <img
-                      src={
-                        compareImage.backupUrl || compareImage.originalUrl
-                      }
-                      alt="Original"
-                      style={{
-                        width: "100%",
-                        height: "auto",
-                        display: "block",
-                      }}
-                    />
-                  </div>
-                </BlockStack>
-              </div>
-
-              {/* WebP */}
-              <div style={{ flex: 1, minWidth: "250px" }}>
-                <BlockStack gap="300">
-                  <InlineStack align="center" gap="200">
-                    <Badge tone="success">WebP (Optimized)</Badge>
-                    <Text as="span" variant="bodySm" tone="subdued">
-                      {compareImage.webpFileSize
-                        ? `${(compareImage.webpFileSize / 1024).toFixed(1)} KB`
-                        : ""}
-                    </Text>
-                    {compareImage.fileSize &&
-                      compareImage.webpFileSize && (
-                        <Text
-                          as="span"
-                          variant="bodySm"
-                          tone="success"
-                        >
-                          {(
-                            ((compareImage.fileSize -
-                              compareImage.webpFileSize) /
-                              compareImage.fileSize) *
-                            100
-                          ).toFixed(1)}
-                          % smaller
-                        </Text>
-                      )}
-                  </InlineStack>
-                  <div
-                    style={{
-                      border: "1px solid #e1e3e5",
-                      borderRadius: "8px",
-                      overflow: "hidden",
-                      backgroundColor: "#fafafa",
-                    }}
-                  >
-                    <img
-                      src={compareImage.webpUrl}
-                      alt="WebP Optimized"
-                      style={{
-                        width: "100%",
-                        height: "auto",
-                        display: "block",
-                      }}
-                    />
-                  </div>
-                </BlockStack>
-              </div>
-            </div>
-          </Modal.Section>
-        </Modal>
+        <CompareModal image={compareImage} onClose={() => setCompareImage(null)} />
       )}
     </Page>
+  );
+}
+
+// ─── Sub-components ────────────────────────────────────────────────────────────
+
+function ResultBanners({
+  actionData,
+  isOptimizing,
+  statsMap,
+}: {
+  actionData: ActionResult | undefined;
+  isOptimizing: boolean;
+  statsMap: StatsMap;
+}) {
+  if (!actionData || !("actionType" in actionData)) return null;
+
+  return (
+    <>
+      {actionData.actionType === "optimize" && !isOptimizing && (
+        <Banner
+          tone={(actionData as { errorCount?: number }).errorCount ? "warning" : "success"}
+          title="Optimization Complete"
+        >
+          <p>
+            Processed: {(actionData as { processedCount: number }).processedCount} | Skipped:{" "}
+            {(actionData as { skippedCount: number }).skippedCount} | Errors:{" "}
+            {(actionData as { errorCount: number }).errorCount}
+            {(actionData as { totalSaved: number }).totalSaved > 0 &&
+              ` | Total saved: ${((actionData as { totalSaved: number }).totalSaved / 1024).toFixed(1)} KB`}
+          </p>
+        </Banner>
+      )}
+
+      {actionData.actionType === "cancelled" && (
+        <Banner tone="warning" title="Optimization Cancelled">
+          <p>
+            Stopped after processing {(actionData as { processedCount: number }).processedCount} image
+            {(actionData as { processedCount: number }).processedCount !== 1 ? "s" : ""}.
+            {(actionData as { errorCount: number }).errorCount > 0 &&
+              ` ${(actionData as { errorCount: number }).errorCount} error(s).`}
+            {(actionData as { totalSaved: number }).totalSaved > 0 &&
+              ` Saved ${((actionData as { totalSaved: number }).totalSaved / 1024).toFixed(1)} KB so far.`}
+          </p>
+        </Banner>
+      )}
+
+      {actionData.actionType === "retry" && (
+        <Banner
+          tone={(actionData as { errorCount?: number }).errorCount ? "warning" : "success"}
+          title="Retry Complete"
+        >
+          <p>
+            Processed: {(actionData as { processedCount: number }).processedCount} | Errors:{" "}
+            {(actionData as { errorCount: number }).errorCount}
+          </p>
+        </Banner>
+      )}
+
+      {actionData.actionType === "revert" && (
+        <Banner
+          tone={
+            (actionData as { errorCount: number }).errorCount > 0
+              ? (actionData as { revertedCount: number }).revertedCount > 0
+                ? "warning"
+                : "critical"
+              : "success"
+          }
+          title="Revert Complete"
+        >
+          <p>
+            Reverted {(actionData as { revertedCount: number }).revertedCount} image
+            {(actionData as { revertedCount: number }).revertedCount !== 1 ? "s" : ""} back to originals.
+            {(actionData as { errorCount: number }).errorCount > 0 &&
+              ` ${(actionData as { errorCount: number }).errorCount} error(s) occurred.`}
+          </p>
+        </Banner>
+      )}
+    </>
+  );
+}
+
+function LiveProgressCard({
+  job,
+  jobProgress,
+  onCancel,
+  isCancelling,
+}: {
+  job: Record<string, number | string | null>;
+  jobProgress: number;
+  onCancel: () => void;
+  isCancelling: boolean;
+}) {
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="200" blockAlign="center">
+            <Spinner size="small" />
+            <Text as="h2" variant="headingMd">Optimizing Images...</Text>
+          </InlineStack>
+          <Button tone="critical" onClick={onCancel} loading={isCancelling}>
+            Cancel
+          </Button>
+        </InlineStack>
+
+        <ProgressBar progress={Math.min(jobProgress, 100)} size="small" tone="primary" />
+
+        <BlockStack gap="100">
+          <Text as="p" variant="bodySm">
+            {(job.processedCount as number) || 0} of {(job.totalImages as number) || "?"} images processed
+            {((job.errorCount as number) || 0) > 0 && ` | ${job.errorCount} error(s)`}
+            {((job.skippedCount as number) || 0) > 0 && ` | ${job.skippedCount} skipped`}
+          </Text>
+          {job.currentImage && (
+            <Text as="p" variant="bodySm" tone="subdued">
+              Currently processing: {job.currentImage as string}
+            </Text>
+          )}
+          {((job.totalSaved as number) || 0) > 0 && (
+            <Text as="p" variant="bodySm" tone="success">
+              Saved so far: {(((job.totalSaved as number) || 0) / 1024).toFixed(1)} KB
+            </Text>
+          )}
+        </BlockStack>
+      </BlockStack>
+    </Card>
+  );
+}
+
+function OptimizationsTable({
+  optimizations,
+  productMap,
+  isReverting,
+  isRetrying,
+  onCompare,
+  onRevert,
+  onRetry,
+}: {
+  optimizations: Array<Record<string, unknown>>;
+  productMap: Record<string, string>;
+  isReverting: boolean;
+  isRetrying: boolean;
+  onCompare: (opt: Record<string, unknown>) => void;
+  onRevert: (id: string) => void;
+  onRetry: (imageId: string) => void;
+}) {
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <Text as="h2" variant="headingMd">Recent Optimizations</Text>
+        {optimizations.length > 0 ? (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid #e1e3e5", textAlign: "left" }}>
+                  <th style={{ padding: "12px 8px" }}>Preview</th>
+                  <th style={{ padding: "12px 8px" }}>Product</th>
+                  <th style={{ padding: "12px 8px" }}>Status</th>
+                  <th style={{ padding: "12px 8px" }}>Original</th>
+                  <th style={{ padding: "12px 8px" }}>WebP</th>
+                  <th style={{ padding: "12px 8px" }}>Savings</th>
+                  <th style={{ padding: "12px 8px" }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {optimizations.map((opt) => (
+                  <OptimizationRow
+                    key={opt.id as string}
+                    opt={opt}
+                    productName={
+                      productMap[opt.productId as string] ||
+                      extractIdFromGid(opt.productId as string)
+                    }
+                    isReverting={isReverting}
+                    isRetrying={isRetrying}
+                    onCompare={onCompare}
+                    onRevert={onRevert}
+                    onRetry={onRetry}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Text as="p" tone="subdued">
+            No optimizations yet. Click Refresh, then Optimize to start.
+          </Text>
+        )}
+      </BlockStack>
+    </Card>
+  );
+}
+
+function OptimizationRow({
+  opt,
+  productName,
+  isReverting,
+  isRetrying,
+  onCompare,
+  onRevert,
+  onRetry,
+}: {
+  opt: Record<string, unknown>;
+  productName: string;
+  isReverting: boolean;
+  isRetrying: boolean;
+  onCompare: (opt: Record<string, unknown>) => void;
+  onRevert: (id: string) => void;
+  onRetry: (imageId: string) => void;
+}) {
+  const thumbUrl = (opt.webpUrl || opt.originalUrl) as string | null;
+  const status = opt.status as string;
+  const fileSize = opt.fileSize as number | null;
+  const webpFileSize = opt.webpFileSize as number | null;
+
+  const statusTone =
+    status === "completed"
+      ? "success"
+      : status === "failed"
+        ? "critical"
+        : status === "processing"
+          ? "attention"
+          : status === "reverted"
+            ? "warning"
+            : "info";
+
+  return (
+    <tr style={{ borderBottom: "1px solid #f1f2f3" }}>
+      <td style={{ padding: "8px" }}>
+        {thumbUrl ? (
+          <div
+            onClick={() => status === "completed" && onCompare(opt)}
+            style={{ cursor: status === "completed" ? "pointer" : "default" }}
+            title={status === "completed" ? "Click to compare original vs WebP" : ""}
+          >
+            <Thumbnail
+              source={thumbUrl}
+              alt={`Image ${extractIdFromGid(opt.imageId as string)}`}
+              size="small"
+            />
+          </div>
+        ) : (
+          <div
+            style={{
+              width: 40,
+              height: 40,
+              backgroundColor: "#f1f2f3",
+              borderRadius: 4,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "10px",
+              color: "#8c9196",
+            }}
+          >
+            N/A
+          </div>
+        )}
+      </td>
+      <td style={{ padding: "8px" }}>
+        <Text as="span" variant="bodyMd" fontWeight="semibold">{productName}</Text>
+      </td>
+      <td style={{ padding: "8px" }}>
+        <Badge tone={statusTone}>{status}</Badge>
+      </td>
+      <td style={{ padding: "8px" }}>
+        {fileSize ? `${(fileSize / 1024).toFixed(1)} KB` : "-"}
+      </td>
+      <td style={{ padding: "8px" }}>
+        {webpFileSize ? `${(webpFileSize / 1024).toFixed(1)} KB` : "-"}
+      </td>
+      <td style={{ padding: "8px" }}>
+        {webpFileSize && fileSize ? (
+          <span style={{ color: "#008060", fontWeight: 600 }}>
+            {(((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)}%
+          </span>
+        ) : (
+          "-"
+        )}
+      </td>
+      <td style={{ padding: "8px" }}>
+        <InlineStack gap="200">
+          {status === "completed" && (
+            <>
+              <Button size="slim" onClick={() => onCompare(opt)}>Compare</Button>
+              <Button
+                size="slim"
+                tone="critical"
+                onClick={() => onRevert(opt.id as string)}
+                loading={isReverting}
+              >
+                Revert
+              </Button>
+            </>
+          )}
+          {status === "failed" && (
+            <Button
+              size="slim"
+              variant="primary"
+              onClick={() => onRetry(opt.imageId as string)}
+              loading={isRetrying}
+            >
+              Retry
+            </Button>
+          )}
+        </InlineStack>
+      </td>
+    </tr>
+  );
+}
+
+function CompareModal({
+  image,
+  onClose,
+}: {
+  image: Record<string, unknown>;
+  onClose: () => void;
+}) {
+  const fileSize = image.fileSize as number | null;
+  const webpFileSize = image.webpFileSize as number | null;
+  const originalSrc = (image.backupUrl || image.originalUrl) as string;
+  const webpSrc = image.webpUrl as string;
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Compare: Original vs WebP"
+      large
+      secondaryActions={[{ content: "Close", onAction: onClose }]}
+    >
+      <Modal.Section>
+        <div style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: "250px" }}>
+            <BlockStack gap="300">
+              <InlineStack align="center" gap="200">
+                <Badge tone="warning">Original</Badge>
+                <Text as="span" variant="bodySm" tone="subdued">
+                  {fileSize ? `${(fileSize / 1024).toFixed(1)} KB` : ""}
+                </Text>
+              </InlineStack>
+              <div
+                style={{
+                  border: "1px solid #e1e3e5",
+                  borderRadius: "8px",
+                  overflow: "hidden",
+                  backgroundColor: "#fafafa",
+                }}
+              >
+                <img src={originalSrc} alt="Original" style={{ width: "100%", height: "auto", display: "block" }} />
+              </div>
+            </BlockStack>
+          </div>
+          <div style={{ flex: 1, minWidth: "250px" }}>
+            <BlockStack gap="300">
+              <InlineStack align="center" gap="200">
+                <Badge tone="success">WebP (Optimized)</Badge>
+                <Text as="span" variant="bodySm" tone="subdued">
+                  {webpFileSize ? `${(webpFileSize / 1024).toFixed(1)} KB` : ""}
+                </Text>
+                {fileSize && webpFileSize && (
+                  <Text as="span" variant="bodySm" tone="success">
+                    {(((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)}% smaller
+                  </Text>
+                )}
+              </InlineStack>
+              <div
+                style={{
+                  border: "1px solid #e1e3e5",
+                  borderRadius: "8px",
+                  overflow: "hidden",
+                  backgroundColor: "#fafafa",
+                }}
+              >
+                <img src={webpSrc} alt="WebP Optimized" style={{ width: "100%", height: "auto", display: "block" }} />
+              </div>
+            </BlockStack>
+          </div>
+        </div>
+      </Modal.Section>
+    </Modal>
   );
 }
