@@ -40,21 +40,93 @@ This document provides a comprehensive manual QA test plan for the Image Compres
 
 | Item | Details |
 |---|---|
-| Shopify Store | Development or Partner test store |
+| Shopify Store | Development store (free, created via Dev Dashboard) |
 | App URL | `https://image-optimizer-app-production.up.railway.app` |
+| App Client ID | `245ba33ff3fdd13456646e458c9332e0` |
 | Browser | Chrome (latest), Firefox (latest), Safari (latest) |
-| Database | PostgreSQL on Railway |
-| Node.js | v20.x or v22.12+ |
 
-### Test Data Preparation
+### Step 1: Create a Shopify Partner Account (if you don't have one)
 
-1. Create or ensure at least **5 products** exist with images:
-   - Product A: 1 image (small, < 50 KB PNG)
-   - Product B: 3 images (medium, 100-500 KB JPG)
-   - Product C: 5 images (large, > 1 MB PNG)
-   - Product D: 1 image (already WebP format)
-   - Product E: 2 images (with existing alt text)
-2. Note the original file sizes and alt text for comparison after optimization.
+1. Go to [https://partners.shopify.com](https://partners.shopify.com) and click **Join now**.
+2. Fill in your name, email, and password. You do not need a paid Shopify plan — Partner accounts are free.
+3. Complete the onboarding questions (select "I'm building apps" or similar).
+4. Verify your email address.
+
+### Step 2: Create a Development Store
+
+Development stores are free test stores where you can install and test apps without processing real transactions.
+
+1. Log in to the [Shopify Dev Dashboard](https://dev.shopify.com).
+2. Click **Dev stores** in the left sidebar.
+3. Click **Add dev store**.
+4. Enter a store name (e.g., `qa-image-optimizer-test`).
+5. Select a plan — **Basic** is fine for testing.
+6. Click **Create store**.
+7. Once created, click the store name to open its Shopify Admin. Bookmark this URL (it will look like `https://admin.shopify.com/store/qa-image-optimizer-test`).
+
+> **Note:** Dev stores cannot process real payments and have a password-protected storefront. This is expected and does not affect app testing.
+
+### Step 3: Install the App on Your Dev Store
+
+The app is deployed at `https://image-optimizer-app-production.up.railway.app`. To install it:
+
+1. Open your dev store's Shopify Admin.
+2. Navigate to the app install URL in your browser:
+   ```
+   https://image-optimizer-app-production.up.railway.app/auth?shop=YOUR-STORE-NAME.myshopify.com
+   ```
+   Replace `YOUR-STORE-NAME` with your actual dev store subdomain (e.g., `qa-image-optimizer-test`).
+3. Shopify will show a permissions screen requesting access to **read/write products** and **read/write files**. Click **Install app**.
+4. You should be redirected to the app's Image Optimizer page inside Shopify Admin.
+5. Verify the app appears under **Apps** in the left sidebar of your Shopify Admin.
+
+> **Troubleshooting:** If you see an error during installation, confirm that:
+> - Your store URL is correct (must end in `.myshopify.com`)
+> - You are logged in as the store owner
+> - The app server is running (visit the App URL directly — it should not show a 502 error)
+
+### Step 4: Add Test Products with Images
+
+You need products with images to test the optimizer. You can add them manually or use Shopify's sample data.
+
+**Option A — Add products manually:**
+
+1. In Shopify Admin, go to **Products** > **Add product**.
+2. Create at least **5 products** with the following image configurations:
+
+| Product | Images | Details |
+|---|---|---|
+| Product A | 1 image | Small file, < 50 KB, PNG format |
+| Product B | 3 images | Medium files, 100–500 KB each, JPG format |
+| Product C | 5 images | Large files, > 1 MB each, PNG format |
+| Product D | 1 image | Already in WebP format |
+| Product E | 2 images | Any format, but add custom alt text to both images |
+
+3. For each product, fill in the **Title**, **Vendor**, and **Product type** fields (these are used by the SEO template feature).
+4. Save each product.
+
+**Option B — Use Shopify's sample data (faster):**
+
+1. In Shopify Admin, go to **Settings** > **Plan**.
+2. Look for the option to **Add sample data** or use the Shopify CLI command:
+   ```
+   shopify populate products --count 10
+   ```
+3. This creates products with placeholder images. You may want to replace some images with larger files to test compression savings.
+
+**After adding products:**
+
+5. Note the original file sizes (visible in **Content** > **Files** in Shopify Admin) and any existing alt text.
+6. Take screenshots of the products page for before/after comparison.
+
+### Step 5: Verify the App Is Working
+
+1. Open the app from **Apps** > **Image Compression WebPro** in Shopify Admin.
+2. Click the **Refresh** button to sync your product images.
+3. You should see a count of images ready to optimize (e.g., "Optimize 12 New Images").
+4. If the count is 0, verify that your products have images and try refreshing again.
+
+You are now ready to begin testing. Proceed to **Section 3: Test Cases**.
 
 ---
 
