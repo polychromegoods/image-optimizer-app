@@ -22,7 +22,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     try {
       await billing.require({
         plans: [MONTHLY_PLAN],
-        isTest: process.env.NODE_ENV !== "production",
+        isTest: process.env.BILLING_TEST_MODE === "true",
         onFailure: async () => {
           throw new Response(null, {
             status: 302,

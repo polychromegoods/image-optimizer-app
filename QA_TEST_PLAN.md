@@ -26,6 +26,7 @@ This document provides a comprehensive manual QA test plan for the Image Compres
 | Edge cases & error handling | Yes |
 | Cross-browser compatibility | Yes |
 | Performance under load | Yes |
+| Billing & subscription (trial, subscribe, cancel) | Yes |
 
 ### Prerequisites
 
@@ -33,6 +34,7 @@ This document provides a comprehensive manual QA test plan for the Image Compres
 - The app installed on the test store
 - Access to Shopify Admin > Products, Content > Files, and the app dashboard
 - A stable internet connection (some tests involve large file uploads)
+- The environment variable `BILLING_TEST_MODE=true` must be set on Railway (this enables test billing so dev stores can subscribe without real charges)
 
 ---
 
@@ -44,6 +46,7 @@ This document provides a comprehensive manual QA test plan for the Image Compres
 | App URL | `https://image-optimizer-app-production.up.railway.app` |
 | App Client ID | `245ba33ff3fdd13456646e458c9332e0` |
 | Browser | Chrome (latest), Firefox (latest), Safari (latest) |
+| Billing Mode | Test mode (`BILLING_TEST_MODE=true` on Railway) — no real charges |
 
 ### Step 1: Create a Shopify Partner Account (if you don't have one)
 
@@ -259,6 +262,28 @@ You are now ready to begin testing. Proceed to **Section 3: Test Cases**.
 | PRF-03 | Polling does not degrade performance | Monitor browser DevTools Network tab during optimization | Polling requests are small (< 5 KB) and occur every ~2 seconds | P2 |
 | PRF-04 | Page load time | Navigate to the Image Optimizer page | Page loads within 3 seconds | P2 |
 
+### 3.13 — Billing & Subscription
+
+> **Important:** All billing tests must be run with `BILLING_TEST_MODE=true` set as an environment variable on Railway. This enables Shopify's test billing mode, which allows dev stores to go through the full subscription flow without real charges. To set this:
+> 1. Go to your Railway dashboard > image-optimizer-app service > Variables
+> 2. Add `BILLING_TEST_MODE` = `true`
+> 3. Redeploy the service
+
+| ID | Test Case | Steps | Expected Result | Priority |
+|---|---|---|---|---|
+| BIL-01 | New user redirected to billing | Install the app on a fresh dev store and open it | User is redirected to the Billing page (not the optimizer) since they have no active subscription | P0 |
+| BIL-02 | Billing page shows plan details | View the Billing page | Page shows "WebPro Monthly" plan at $6.99/month with feature list, 7-day trial badge, and "Start Free 7-Day Trial" button | P0 |
+| BIL-03 | Subscribe with free trial | Click "Start Free 7-Day Trial" | Shopify redirects to a payment approval page. Approve the charge. User is redirected back to the app. The billing page shows "Active" badge and subscription details | P0 |
+| BIL-04 | Trial indicator shown | After subscribing, check the billing page | Banner says "Your subscription is active" and mentions the free trial if still within the 7-day window | P1 |
+| BIL-05 | App features accessible after subscribing | After subscribing, navigate to Image Optimizer and Settings | Both pages load normally without being redirected to billing | P0 |
+| BIL-06 | Cancel subscription | On the billing page, click "Cancel Subscription" | Subscription is cancelled. The billing page updates to show "Not subscribed" badge and the "Start Free 7-Day Trial" button reappears | P0 |
+| BIL-07 | App gated after cancellation | After cancelling, try to navigate to Image Optimizer | User is redirected back to the Billing page | P0 |
+| BIL-08 | Re-subscribe after cancellation | After cancelling, click "Start Free 7-Day Trial" again | Shopify payment flow starts. After approval, app is accessible again | P1 |
+| BIL-09 | Billing page accessible without subscription | While not subscribed, navigate directly to /app/billing | Billing page loads (it is not gated behind the paywall) | P1 |
+| BIL-10 | Test mode indicator | After subscribing in test mode, check billing page | "(Test mode)" text appears next to subscription status | P2 |
+| BIL-11 | Billing nav link | Check the app navigation sidebar | "Billing" link appears in the nav menu alongside Home, Image Optimizer, and SEO Settings | P1 |
+| BIL-12 | FAQ section visible | Scroll down on the billing page | FAQ section with 4 questions about trial, reverting, billing, and image limits is visible | P2 |
+
 ---
 
 ## 4. Test Execution Checklist
@@ -334,6 +359,18 @@ Use this checklist during QA testing. Mark each test as Pass (P), Fail (F), Bloc
 | PRF-02 | | |
 | PRF-03 | | |
 | PRF-04 | | |
+| BIL-01 | | |
+| BIL-02 | | |
+| BIL-03 | | |
+| BIL-04 | | |
+| BIL-05 | | |
+| BIL-06 | | |
+| BIL-07 | | |
+| BIL-08 | | |
+| BIL-09 | | |
+| BIL-10 | | |
+| BIL-11 | | |
+| BIL-12 | | |
 
 ---
 

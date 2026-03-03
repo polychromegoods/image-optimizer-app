@@ -24,7 +24,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Check current subscription status
   const billingCheck = await billing.check({
     plans: [MONTHLY_PLAN],
-    isTest: process.env.NODE_ENV !== "production",
+    isTest: process.env.BILLING_TEST_MODE === "true",
   });
 
   const hasActiveSubscription = billingCheck.hasActivePayment;
@@ -69,7 +69,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (actionType === "subscribe") {
     await billing.request({
       plan: MONTHLY_PLAN,
-      isTest: process.env.NODE_ENV !== "production",
+      isTest: process.env.BILLING_TEST_MODE === "true",
     });
     // billing.request() throws a redirect response, so this line won't execute
     return json({ success: true });
@@ -80,7 +80,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (subscriptionId) {
       await billing.cancel({
         subscriptionId,
-        isTest: process.env.NODE_ENV !== "production",
+        isTest: process.env.BILLING_TEST_MODE === "true",
         prorate: true,
       });
     }
