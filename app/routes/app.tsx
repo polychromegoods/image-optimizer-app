@@ -1,18 +1,45 @@
 import type { HeadersFunction, LoaderFunctionArgs } from "@remix-run/node";
+import { json } from "@remix-run/node";
 import { Link, Outlet, useLoaderData, useRouteError } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
 import { NavMenu } from "@shopify/app-bridge-react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 
-import { authenticate } from "../shopify.server";
+import { authenticate, MONTHLY_PLAN } from "../shopify.server";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { billing } = await authenticate.admin(request);
 
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  // Check billing status — redirect to billing page if no active subscription
+  // This gates all /app/* routes behind the paywall
+  const url = new URL(request.url);
+  const isBillingPage = url.pathname === "/app/billing";
+
+  if (!isBillingPage) {
+    try {
+      await billing.require({
+        plans: [MONTHLY_PLAN],
+        isTest: process.env.NODE_ENV !== "production",
+        onFailure: async () => {
+          throw new Response(null, {
+            status: 302,
+            headers: { Location: "/app/billing" },
+          });
+        },
+      });
+    } catch (response) {
+      if (response instanceof Response) {
+        throw response;
+      }
+      // If it's a Shopify redirect (for payment), let it through
+      throw response;
+    }
+  }
+
+  return json({ apiKey: process.env.SHOPIFY_API_KEY || "" });
 };
 
 export default function App() {
@@ -26,6 +53,7 @@ export default function App() {
         </Link>
         <Link to="/app/image-optimizer">Image Optimizer</Link>
         <Link to="/app/settings">SEO Settings</Link>
+        <Link to="/app/billing">Billing</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>
