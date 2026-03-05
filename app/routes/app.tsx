@@ -1,10 +1,17 @@
 import type { HeadersFunction, LoaderFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
-import { Link, Outlet, useLoaderData, useRouteError } from "@remix-run/react";
+import { json, redirect } from "@remix-run/node";
+import {
+  Link,
+  Outlet,
+  useLoaderData,
+  useRouteError,
+  useNavigate,
+} from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
 import { NavMenu } from "@shopify/app-bridge-react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
+import { useEffect } from "react";
 
 import { authenticate, MONTHLY_PLAN } from "../shopify.server";
 
@@ -13,37 +20,34 @@ export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { billing } = await authenticate.admin(request);
 
-  // Check billing status — redirect to billing page if no active subscription
-  // This gates all /app/* routes behind the paywall
   const url = new URL(request.url);
   const isBillingPage = url.pathname === "/app/billing";
 
+  let needsBilling = false;
+
   if (!isBillingPage) {
-    try {
-      await billing.require({
-        plans: [MONTHLY_PLAN],
-        isTest: process.env.BILLING_TEST_MODE === "true",
-        onFailure: async () => {
-          throw new Response(null, {
-            status: 302,
-            headers: { Location: "/app/billing" },
-          });
-        },
-      });
-    } catch (response) {
-      if (response instanceof Response) {
-        throw response;
-      }
-      // If it's a Shopify redirect (for payment), let it through
-      throw response;
-    }
+    const billingCheck = await billing.check({
+      plans: [MONTHLY_PLAN],
+      isTest: process.env.BILLING_TEST_MODE === "true",
+    });
+    needsBilling = !billingCheck.hasActivePayment;
   }
 
-  return json({ apiKey: process.env.SHOPIFY_API_KEY || "" });
+  return json({
+    apiKey: process.env.SHOPIFY_API_KEY || "",
+    needsBilling,
+  });
 };
 
 export default function App() {
-  const { apiKey } = useLoaderData<typeof loader>();
+  const { apiKey, needsBilling } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (needsBilling) {
+      navigate("/app/billing");
+    }
+  }, [needsBilling, navigate]);
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
