@@ -53,10 +53,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       };
     }
   } catch (error) {
-    // BUG-008 FIX: Don't crash if billing check fails
-    console.error("Billing check error:", error);
+    console.error("[Billing Loader] billing.check error:", error);
+    // Re-throw Response objects (auth redirects etc.)
     if (error instanceof Response) {
-      throw error; // Re-throw redirect responses
+      throw error;
     }
   }
 
@@ -77,30 +77,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const isTest = process.env.BILLING_TEST_MODE === "true";
 
   if (actionType === "subscribe") {
-    try {
-      // BUG-008 FIX: billing.request() throws a Response redirect to Shopify's
-      // billing approval page. We need to let that throw propagate.
-      // The returnUrl must be a valid URL that Shopify can redirect back to.
-      const appUrl = process.env.SHOPIFY_APP_URL || "";
-      await billing.request({
-        plan: MONTHLY_PLAN,
-        isTest,
-        returnUrl: `${appUrl}/app/billing`,
-      });
-      // If we somehow get here (shouldn't), return success
-      return json({ success: true });
-    } catch (error) {
-      // billing.request() throws a Response for the redirect — this is EXPECTED
-      if (error instanceof Response) {
-        throw error; // Re-throw so Remix handles the redirect
-      }
-      // Actual error
-      console.error("Billing request error:", error);
-      return json({
-        success: false,
-        error: `Failed to start subscription: ${error instanceof Error ? error.message : String(error)}`,
-      });
-    }
+    // billing.request() ALWAYS throws — it never returns.
+    // For embedded XHR requests: throws a 401 Response with
+    //   X-Shopify-API-Request-Failure-Reauthorize-Url header
+    // App Bridge intercepts this and redirects to the billing approval page.
+    //
+    // We MUST let this throw propagate up to Remix unhandled.
+    // Do NOT wrap in try/catch — any catch block risks swallowing the Response.
+
+    console.log("[Billing] Starting billing.request for shop:", session.shop, "isTest:", isTest);
+
+    await billing.request({
+      plan: MONTHLY_PLAN,
+      isTest,
+    });
+
+    // This line is unreachable — billing.request() always throws.
+    // But TypeScript needs it for return type.
+    return json({ success: true });
   }
 
   if (actionType === "cancel") {
@@ -123,7 +117,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       return json({ success: false, error: "No active subscription found to cancel" });
     } catch (error) {
-      console.error("Cancel error:", error);
+      console.error("[Billing] Cancel error:", error);
       if (error instanceof Response) {
         throw error;
       }
