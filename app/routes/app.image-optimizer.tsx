@@ -39,6 +39,7 @@ import {
   runOptimizationLoop,
   revertSingleOptimization,
   countImagesToProcess,
+  getRunningJob,
 } from "../lib/optimization-engine";
 
 // ─── Loader ────────────────────────────────────────────────────────────────────
@@ -123,6 +124,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const isRetry = actionType === "retry_single";
     const targetImageId = isRetry ? (formData.get("imageId") as string) : null;
 
+    // BUG-007 FIX: Check for already running job
+    const existingJob = await getRunningJob(shop);
+    if (existingJob && !isRetry) {
+      return json<ActionResult>({
+        success: false,
+        message: "An optimization is already running. Please wait for it to finish or cancel it first.",
+      });
+    }
+
     const [seoSettings, shopResponse, productsResponse] = await Promise.all([
       db.seoSettings.findUnique({ where: { shop } }),
       admin.graphql(QUERY_SHOP_NAME),
@@ -204,12 +214,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     for (const opt of optimizations) {
       try {
-        await revertSingleOptimization(admin, opt);
+        await revertSingleOptimization(admin, {
+          ...opt,
+          shop,
+        });
         revertedCount++;
       } catch (error) {
         console.error(`Error reverting image ${opt.imageId}:`, error);
         errorCount++;
       }
+      // BUG-005 FIX: Small delay between reverts to reduce connection pressure
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
     return json<ActionResult>({
@@ -236,7 +251,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         });
       }
 
-      await revertSingleOptimization(admin, opt);
+      await revertSingleOptimization(admin, {
+        ...opt,
+        shop,
+      });
       return json<ActionResult>({ success: true, actionType: "revert_single" });
     } catch (error) {
       console.error("Error reverting single image:", error);
@@ -272,6 +290,8 @@ export default function ImageOptimizer() {
   );
   const [liveStats, setLiveStats] = useState(initialStats);
   const [liveOptimizations, setLiveOptimizations] = useState(initialOptimizations);
+  // BUG-006 FIX: Track network errors for user-friendly display
+  const [networkError, setNetworkError] = useState<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isSubmitting = navigation.state === "submitting";
@@ -299,6 +319,7 @@ export default function ImageOptimizer() {
           });
           if (resp.ok) {
             const data = await resp.json();
+            setNetworkError(null); // Clear any previous network error
             if (data.hasJob) {
               setLiveJob(data.job);
               if (data.stats) setLiveStats(data.stats);
@@ -313,7 +334,12 @@ export default function ImageOptimizer() {
             }
           }
         } catch (e) {
+          // BUG-006 FIX: Show user-friendly error instead of crashing
           console.error("Polling error:", e);
+          setNetworkError(
+            "Network connection interrupted. The optimization is still running in the background. " +
+            "Please check your connection and refresh the page."
+          );
         }
       }, POLLING_INTERVAL_MS);
     }
@@ -355,7 +381,8 @@ export default function ImageOptimizer() {
     { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
   );
 
-  const completionPercentage = totalImages > 0 ? (statsMap.completed / totalImages) * 100 : 0;
+  // BUG-002 FIX: Use totalImages from the actual product count, not DB records
+  const completionPercentage = totalImages > 0 ? Math.min((statsMap.completed / totalImages) * 100, 100) : 0;
 
   const job = liveJob as Record<string, number | string | null> | null;
   const jobProgress =
@@ -368,6 +395,7 @@ export default function ImageOptimizer() {
   // ── Handlers ──
 
   const handleOptimizeNew = () => {
+    setNetworkError(null);
     const fd = new FormData();
     fd.append("action", "optimize_new");
     submit(fd, { method: "post" });
@@ -423,6 +451,20 @@ export default function ImageOptimizer() {
       <Layout>
         <Layout.Section>
           <BlockStack gap="500">
+            {/* BUG-006 FIX: Network error banner */}
+            {networkError && (
+              <Banner tone="warning" title="Connection Issue" onDismiss={() => setNetworkError(null)}>
+                <p>{networkError}</p>
+              </Banner>
+            )}
+
+            {/* BUG-007 FIX: Show error if concurrent optimization attempted */}
+            {actionData && !actionData.success && "message" in actionData && actionData.message && (
+              <Banner tone="critical" title="Error">
+                <p>{actionData.message}</p>
+              </Banner>
+            )}
+
             {/* Result banners */}
             <ResultBanners actionData={actionData} isOptimizing={isOptimizing} statsMap={statsMap} />
 
@@ -477,8 +519,7 @@ export default function ImageOptimizer() {
                   <BlockStack gap="200">
                     <Text as="p">Total images: {totalImages}</Text>
                     <Text as="p">
-                      Optimized: {statsMap.completed} | Failed: {statsMap.failed} | Reverted:{" "}
-                      {statsMap.reverted || 0}
+                      Optimized: {Math.min(statsMap.completed, totalImages)} | Failed: {statsMap.failed}
                     </Text>
                   </BlockStack>
                   <InlineStack gap="300">
@@ -558,6 +599,8 @@ function ResultBanners({
   statsMap: StatsMap;
 }) {
   if (!actionData || !("actionType" in actionData)) return null;
+  // Don't show error messages here — they're handled separately above
+  if (!actionData.success && "message" in actionData) return null;
 
   return (
     <>
@@ -576,14 +619,16 @@ function ResultBanners({
         </Banner>
       )}
 
-      {actionData.actionType === "cancelled" && (
+      {/* CAN-02 FIX: Show cancelled banner from both actionData AND from cancel action */}
+      {(actionData.actionType === "cancelled" || actionData.actionType === "cancel") && (
         <Banner tone="warning" title="Optimization Cancelled">
           <p>
-            Stopped after processing {(actionData as { processedCount: number }).processedCount} image
-            {(actionData as { processedCount: number }).processedCount !== 1 ? "s" : ""}.
-            {(actionData as { errorCount: number }).errorCount > 0 &&
+            {"processedCount" in actionData
+              ? `Stopped after processing ${(actionData as { processedCount: number }).processedCount} image${(actionData as { processedCount: number }).processedCount !== 1 ? "s" : ""}.`
+              : "Optimization was cancelled."}
+            {"errorCount" in actionData && (actionData as { errorCount: number }).errorCount > 0 &&
               ` ${(actionData as { errorCount: number }).errorCount} error(s).`}
-            {(actionData as { totalSaved: number }).totalSaved > 0 &&
+            {"totalSaved" in actionData && (actionData as { totalSaved: number }).totalSaved > 0 &&
               ` Saved ${((actionData as { totalSaved: number }).totalSaved / 1024).toFixed(1)} KB so far.`}
           </p>
         </Banner>
@@ -618,6 +663,12 @@ function ResultBanners({
             {(actionData as { errorCount: number }).errorCount > 0 &&
               ` ${(actionData as { errorCount: number }).errorCount} error(s) occurred.`}
           </p>
+        </Banner>
+      )}
+
+      {actionData.actionType === "revert_single" && (
+        <Banner tone="success" title="Image Reverted">
+          <p>The image has been restored to its original version.</p>
         </Banner>
       )}
     </>
@@ -769,6 +820,12 @@ function OptimizationRow({
             ? "warning"
             : "info";
 
+  // BUG-003: Show savings correctly — if webp >= original, show 0%
+  const savingsPercent =
+    webpFileSize && fileSize && webpFileSize < fileSize
+      ? (((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)
+      : null;
+
   return (
     <tr style={{ borderBottom: "1px solid #f1f2f3" }}>
       <td style={{ padding: "8px" }}>
@@ -815,9 +872,13 @@ function OptimizationRow({
         {webpFileSize ? `${(webpFileSize / 1024).toFixed(1)} KB` : "-"}
       </td>
       <td style={{ padding: "8px" }}>
-        {webpFileSize && fileSize ? (
+        {savingsPercent ? (
           <span style={{ color: "#008060", fontWeight: 600 }}>
-            {(((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)}%
+            {savingsPercent}%
+          </span>
+        ) : fileSize && webpFileSize && webpFileSize >= fileSize ? (
+          <span style={{ color: "#8c9196" }}>
+            Kept original
           </span>
         ) : (
           "-"
@@ -903,7 +964,7 @@ function CompareModal({
                 <Text as="span" variant="bodySm" tone="subdued">
                   {webpFileSize ? `${(webpFileSize / 1024).toFixed(1)} KB` : ""}
                 </Text>
-                {fileSize && webpFileSize && (
+                {fileSize && webpFileSize && webpFileSize < fileSize && (
                   <Text as="span" variant="bodySm" tone="success">
                     {(((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)}% smaller
                   </Text>

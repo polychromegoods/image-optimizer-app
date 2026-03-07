@@ -1,6 +1,6 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
-import { json, redirect } from "@remix-run/node";
-import { useLoaderData, useSubmit, useNavigation } from "@remix-run/react";
+import { json } from "@remix-run/node";
+import { useLoaderData, useSubmit, useNavigation, useActionData } from "@remix-run/react";
 import {
   Page,
   Layout,
@@ -20,17 +20,9 @@ import { authenticate, MONTHLY_PLAN } from "../shopify.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { billing, session } = await authenticate.admin(request);
+  const isTest = process.env.BILLING_TEST_MODE === "true";
 
-  // Check current subscription status
-  const billingCheck = await billing.check({
-    plans: [MONTHLY_PLAN],
-    isTest: process.env.BILLING_TEST_MODE === "true",
-  });
-
-  const hasActiveSubscription = billingCheck.hasActivePayment;
-  const appSubscriptions = billingCheck.appSubscriptions || [];
-
-  // Find active subscription details
+  let hasActiveSubscription = false;
   let currentSubscription: {
     name: string;
     status: string;
@@ -40,22 +32,39 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     id: string;
   } | null = null;
 
-  if (appSubscriptions.length > 0) {
-    const sub = appSubscriptions[0];
-    currentSubscription = {
-      name: sub.name,
-      status: sub.status,
-      trialDays: sub.trialDays ?? null,
-      currentPeriodEnd: sub.currentPeriodEnd ?? null,
-      test: sub.test ?? false,
-      id: sub.id,
-    };
+  try {
+    const billingCheck = await billing.check({
+      plans: [MONTHLY_PLAN],
+      isTest,
+    });
+
+    hasActiveSubscription = billingCheck.hasActivePayment;
+    const appSubscriptions = billingCheck.appSubscriptions || [];
+
+    if (appSubscriptions.length > 0) {
+      const sub = appSubscriptions[0];
+      currentSubscription = {
+        name: sub.name,
+        status: sub.status,
+        trialDays: sub.trialDays ?? null,
+        currentPeriodEnd: sub.currentPeriodEnd ?? null,
+        test: sub.test ?? false,
+        id: sub.id,
+      };
+    }
+  } catch (error) {
+    // BUG-008 FIX: Don't crash if billing check fails
+    console.error("Billing check error:", error);
+    if (error instanceof Response) {
+      throw error; // Re-throw redirect responses
+    }
   }
 
   return json({
     shop: session.shop,
     hasActiveSubscription,
     currentSubscription,
+    isTestMode: isTest,
   });
 };
 
@@ -65,36 +74,75 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const { billing, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const actionType = formData.get("action") as string;
+  const isTest = process.env.BILLING_TEST_MODE === "true";
 
   if (actionType === "subscribe") {
-    await billing.request({
-      plan: MONTHLY_PLAN,
-      isTest: process.env.BILLING_TEST_MODE === "true",
-    });
-    // billing.request() throws a redirect response, so this line won't execute
-    return json({ success: true });
+    try {
+      // BUG-008 FIX: billing.request() throws a Response redirect to Shopify's
+      // billing approval page. We need to let that throw propagate.
+      // The returnUrl must be a valid URL that Shopify can redirect back to.
+      const appUrl = process.env.SHOPIFY_APP_URL || "";
+      await billing.request({
+        plan: MONTHLY_PLAN,
+        isTest,
+        returnUrl: `${appUrl}/app/billing`,
+      });
+      // If we somehow get here (shouldn't), return success
+      return json({ success: true });
+    } catch (error) {
+      // billing.request() throws a Response for the redirect — this is EXPECTED
+      if (error instanceof Response) {
+        throw error; // Re-throw so Remix handles the redirect
+      }
+      // Actual error
+      console.error("Billing request error:", error);
+      return json({
+        success: false,
+        error: `Failed to start subscription: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
   }
 
   if (actionType === "cancel") {
-    const subscriptionId = formData.get("subscriptionId") as string;
-    if (subscriptionId) {
-      await billing.cancel({
-        subscriptionId,
-        isTest: process.env.BILLING_TEST_MODE === "true",
-        prorate: true,
+    try {
+      const billingCheck = await billing.check({
+        plans: [MONTHLY_PLAN],
+        isTest,
+      });
+
+      const appSubscriptions = billingCheck.appSubscriptions || [];
+      if (appSubscriptions.length > 0) {
+        const sub = appSubscriptions[0];
+        await billing.cancel({
+          subscriptionId: sub.id,
+          isTest,
+          prorate: true,
+        });
+        return json({ success: true, cancelled: true });
+      }
+
+      return json({ success: false, error: "No active subscription found to cancel" });
+    } catch (error) {
+      console.error("Cancel error:", error);
+      if (error instanceof Response) {
+        throw error;
+      }
+      return json({
+        success: false,
+        error: `Failed to cancel: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
-    return json({ success: true, cancelled: true });
   }
 
-  return json({ success: false });
+  return json({ success: false, error: "Unknown action" });
 };
 
 // ─── Component ─────────────────────────────────────────────────────────────────
 
 export default function BillingPage() {
-  const { hasActiveSubscription, currentSubscription } =
+  const { hasActiveSubscription, currentSubscription, isTestMode } =
     useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
   const isSubmitting = navigation.state === "submitting";
@@ -104,12 +152,7 @@ export default function BillingPage() {
   };
 
   const handleCancel = () => {
-    if (currentSubscription?.id) {
-      submit(
-        { action: "cancel", subscriptionId: currentSubscription.id },
-        { method: "post" },
-      );
-    }
+    submit({ action: "cancel" }, { method: "post" });
   };
 
   const features = [
@@ -126,13 +169,39 @@ export default function BillingPage() {
   return (
     <Page title="Billing" backAction={{ url: "/app" }}>
       <Layout>
+        {/* Error banner */}
+        {actionData && "error" in actionData && actionData.error && (
+          <Layout.Section>
+            <Banner tone="critical" title="Billing Error">
+              <p>{actionData.error as string}</p>
+            </Banner>
+          </Layout.Section>
+        )}
+
+        {/* Cancellation success */}
+        {actionData && "cancelled" in actionData && actionData.cancelled && (
+          <Layout.Section>
+            <Banner tone="success" title="Subscription Cancelled">
+              <p>Your subscription has been cancelled. You can re-subscribe anytime.</p>
+            </Banner>
+          </Layout.Section>
+        )}
+
+        {/* Test mode indicator */}
+        {isTestMode && (
+          <Layout.Section>
+            <Banner tone="info">
+              <p>
+                Billing is running in <strong>test mode</strong>. No real charges will be made.
+              </p>
+            </Banner>
+          </Layout.Section>
+        )}
+
         {/* Current Plan Status */}
         {hasActiveSubscription && currentSubscription && (
           <Layout.Section>
-            <Banner
-              title="Your subscription is active"
-              tone="success"
-            >
+            <Banner title="Your subscription is active" tone="success">
               <p>
                 You're on the <strong>{currentSubscription.name}</strong>.
                 {currentSubscription.status === "ACTIVE" &&
@@ -147,10 +216,7 @@ export default function BillingPage() {
 
         {!hasActiveSubscription && (
           <Layout.Section>
-            <Banner
-              title="Start your free trial"
-              tone="info"
-            >
+            <Banner title="Start your free trial" tone="info">
               <p>
                 Try Image Compression WebPro free for 7 days. No credit card
                 required to start. Cancel anytime.
