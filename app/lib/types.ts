@@ -43,6 +43,7 @@ export interface ImageOptimizationRecord {
   backupUrl: string | null;
   webpUrl: string | null;
   webpGid: string | null;
+  newMediaId: string | null;
   status: OptimizationStatus;
   fileSize: number | null;
   webpFileSize: number | null;
@@ -145,6 +146,7 @@ export interface LoaderData {
   products: ShopifyProduct[];
   totalImages: number;
   newImages: number;
+  optimizedCount: number;
   seoSettings: SeoSettingsRecord | null;
   activeJob: OptimizationJobRecord | null;
 }

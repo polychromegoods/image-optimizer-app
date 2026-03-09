@@ -73,7 +73,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const productsData = await productsResponse.json();
   const products = parseProductsResponse(productsData);
 
-  const { totalImages, newImages } = await countImagesToProcess(shop, products, null);
+  const { totalImages, newImages, optimizedCount } = await countImagesToProcess(shop, products, null);
 
   return json<LoaderData>({
     shop,
@@ -82,6 +82,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     products,
     totalImages,
     newImages,
+    optimizedCount,
     seoSettings,
     activeJob,
   });
@@ -274,6 +275,7 @@ export default function ImageOptimizer() {
     products,
     totalImages,
     newImages,
+    optimizedCount,
     seoSettings,
     activeJob: initialActiveJob,
   } = useLoaderData<typeof loader>();
@@ -381,8 +383,8 @@ export default function ImageOptimizer() {
     { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
   );
 
-  // BUG-002 FIX: Use totalImages from the actual product count, not DB records
-  const completionPercentage = totalImages > 0 ? Math.min((statsMap.completed / totalImages) * 100, 100) : 0;
+  // BUG-002/BUG-009 FIX: Use optimizedCount from countImagesToProcess (deduped, accurate)
+  const completionPercentage = totalImages > 0 ? Math.min((optimizedCount / totalImages) * 100, 100) : 0;
 
   const job = liveJob as Record<string, number | string | null> | null;
   const jobProgress =
@@ -519,7 +521,7 @@ export default function ImageOptimizer() {
                   <BlockStack gap="200">
                     <Text as="p">Total images: {totalImages}</Text>
                     <Text as="p">
-                      Optimized: {Math.min(statsMap.completed, totalImages)} | Failed: {statsMap.failed}
+                      Optimized: {optimizedCount} | Failed: {statsMap.failed}
                     </Text>
                   </BlockStack>
                   <InlineStack gap="300">
@@ -533,7 +535,7 @@ export default function ImageOptimizer() {
                         ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
                         : "No New Images to Optimize"}
                     </Button>
-                    {statsMap.completed > 0 && (
+                    {optimizedCount > 0 && (
                       <Button
                         tone="critical"
                         onClick={() => setShowRevertModal(true)}

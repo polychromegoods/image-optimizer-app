@@ -44,6 +44,7 @@ model ImageOptimization {
   backupUrl       String?  // Permanent backup URL in Shopify Files for safe revert
   webpUrl         String?
   webpGid         String?
+  newMediaId      String?  // The new WebP media GID after optimization (for dedup on refresh)
   status          String   @default("pending")
   fileSize        Int?
   webpFileSize    Int?

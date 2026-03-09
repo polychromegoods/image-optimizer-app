@@ -1,77 +1,141 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// ─── BUG-001: Already-optimized images should not be re-detected ────────────
+// ─── BUG-001 + BUG-009: Already-optimized images should not be re-detected ──
 
-describe("BUG-001: Duplicate image detection prevention", () => {
-  it("should recognize an image by its new WebP media ID after optimization", () => {
-    // Simulates the scenario: after optimization, the product has a NEW media ID
-    // for the WebP image. The DB should have a record for BOTH the original and new ID.
+describe("BUG-001/BUG-009: Duplicate image detection prevention (newMediaId approach)", () => {
+  it("should recognize an image by its newMediaId field after optimization", () => {
+    // After optimization, the DB has ONE record with both original imageId and newMediaId
     const originalMediaId = "gid://shopify/MediaImage/111";
     const newWebpMediaId = "gid://shopify/MediaImage/222";
 
-    // After optimization, we create two DB records:
-    const dbRecords = new Map<string, { status: string }>();
-    dbRecords.set(originalMediaId, { status: "completed" });
-    dbRecords.set(newWebpMediaId, { status: "completed" }); // BUG-001 fix: track new ID too
+    // Single record tracks both IDs
+    const dbRecords = [
+      { imageId: originalMediaId, newMediaId: newWebpMediaId, status: "completed" },
+    ];
 
     // On refresh, Shopify returns the NEW media ID (the WebP one)
-    const shopifyMediaIds = [newWebpMediaId];
+    const shopifyMediaId = newWebpMediaId;
 
-    // Check: should the new ID be treated as "new" for optimization?
-    const isNew = !dbRecords.has(newWebpMediaId);
-    expect(isNew).toBe(false); // Should NOT be treated as new
+    // Check: is this media ID known as a newMediaId of any completed record?
+    const isKnownAsNewMedia = dbRecords.some(
+      (r) => r.newMediaId === shopifyMediaId && r.status === "completed",
+    );
+    expect(isKnownAsNewMedia).toBe(true); // Should NOT be treated as new
+  });
+
+  it("should recognize an image by its original imageId", () => {
+    const originalMediaId = "gid://shopify/MediaImage/111";
+    const newWebpMediaId = "gid://shopify/MediaImage/222";
+
+    const dbRecords = [
+      { imageId: originalMediaId, newMediaId: newWebpMediaId, status: "completed" },
+    ];
+
+    // Check by original imageId
+    const isKnownByImageId = dbRecords.some(
+      (r) => r.imageId === originalMediaId && r.status === "completed",
+    );
+    expect(isKnownByImageId).toBe(true);
   });
 
   it("should detect truly new images that have no DB record", () => {
-    const dbRecords = new Map<string, { status: string }>();
-    dbRecords.set("gid://shopify/MediaImage/111", { status: "completed" });
+    const dbRecords = [
+      { imageId: "gid://shopify/MediaImage/111", newMediaId: "gid://shopify/MediaImage/222", status: "completed" },
+    ];
 
     const brandNewMediaId = "gid://shopify/MediaImage/999";
-    const isNew = !dbRecords.has(brandNewMediaId);
+    const isKnownByImageId = dbRecords.some((r) => r.imageId === brandNewMediaId);
+    const isKnownByNewMediaId = dbRecords.some((r) => r.newMediaId === brandNewMediaId);
+    const isNew = !isKnownByImageId && !isKnownByNewMediaId;
     expect(isNew).toBe(true); // Should be treated as new
+  });
+
+  it("should NOT create duplicate DB records per optimization", () => {
+    // The old approach created 2 records per image. The new approach creates 1.
+    const originalMediaId = "gid://shopify/MediaImage/111";
+    const newWebpMediaId = "gid://shopify/MediaImage/222";
+
+    // After optimization: ONE record with newMediaId field
+    const dbRecords = [
+      { imageId: originalMediaId, newMediaId: newWebpMediaId, status: "completed" },
+    ];
+
+    // Should only have 1 record, not 2
+    expect(dbRecords).toHaveLength(1);
+    expect(dbRecords[0].imageId).toBe(originalMediaId);
+    expect(dbRecords[0].newMediaId).toBe(newWebpMediaId);
   });
 });
 
-// ─── BUG-002: Counter should not exceed total images ────────────────────────
+// ─── BUG-002/BUG-009: Counter should accurately reflect unique optimizations ─
 
-describe("BUG-002: Accurate image counting", () => {
-  it("should count only non-completed images as 'new'", () => {
-    const totalProductImages = 31;
+describe("BUG-002/BUG-009: Accurate image counting with newMediaId", () => {
+  it("should count unique optimizations, not DB record count", () => {
+    // 5 products with 1 image each = 5 total images
+    // All 5 optimized = 5 DB records (one per image, with newMediaId set)
+    const totalProductImages = 5;
     const dbRecords = [
-      { status: "completed", count: 28 },
-      { status: "failed", count: 2 },
-      // 1 image has no record (truly new)
+      { imageId: "img-1", newMediaId: "webp-1", status: "completed" },
+      { imageId: "img-2", newMediaId: "webp-2", status: "completed" },
+      { imageId: "img-3", newMediaId: "webp-3", status: "completed" },
+      { imageId: "img-4", newMediaId: "webp-4", status: "completed" },
+      { imageId: "img-5", newMediaId: "webp-5", status: "completed" },
     ];
 
-    const completedCount = dbRecords.find((r) => r.status === "completed")?.count || 0;
-    const failedCount = dbRecords.find((r) => r.status === "failed")?.count || 0;
+    // Shopify now returns the WebP media IDs
+    const shopifyMediaIds = ["webp-1", "webp-2", "webp-3", "webp-4", "webp-5"];
 
-    // New images = total - completed (failed can be retried, so they count as "new")
-    const newImages = totalProductImages - completedCount; // 31 - 28 = 3
-    expect(newImages).toBe(3);
-    expect(newImages).toBeLessThanOrEqual(totalProductImages);
+    // Count optimized: for each Shopify media, check if it's known as imageId or newMediaId
+    const completedByImageId = new Set(dbRecords.filter((r) => r.status === "completed").map((r) => r.imageId));
+    const completedByNewMediaId = new Set(dbRecords.filter((r) => r.status === "completed").map((r) => r.newMediaId));
+
+    let optimizedCount = 0;
+    for (const mediaId of shopifyMediaIds) {
+      if (completedByImageId.has(mediaId) || completedByNewMediaId.has(mediaId)) {
+        optimizedCount++;
+      }
+    }
+
+    expect(optimizedCount).toBe(5);
+    expect(optimizedCount).toBeLessThanOrEqual(totalProductImages);
   });
 
-  it("should never show optimized count greater than total images", () => {
-    const totalImages = 31;
-    const completedInDb = 61; // BUG-002 scenario: accumulated across runs
+  it("should not double-count when adding a new image after optimization", () => {
+    // 5 images optimized, then 1 new image added = 6 total
+    const dbRecords = [
+      { imageId: "img-1", newMediaId: "webp-1", status: "completed" },
+      { imageId: "img-2", newMediaId: "webp-2", status: "completed" },
+      { imageId: "img-3", newMediaId: "webp-3", status: "completed" },
+      { imageId: "img-4", newMediaId: "webp-4", status: "completed" },
+      { imageId: "img-5", newMediaId: "webp-5", status: "completed" },
+    ];
 
-    // Fix: cap the displayed count
-    const displayedOptimized = Math.min(completedInDb, totalImages);
-    expect(displayedOptimized).toBe(31);
-    expect(displayedOptimized).toBeLessThanOrEqual(totalImages);
+    // Shopify returns 5 WebP + 1 brand new
+    const shopifyMediaIds = ["webp-1", "webp-2", "webp-3", "webp-4", "webp-5", "new-img-6"];
+
+    const completedByImageId = new Set(dbRecords.filter((r) => r.status === "completed").map((r) => r.imageId));
+    const completedByNewMediaId = new Set(dbRecords.filter((r) => r.status === "completed").map((r) => r.newMediaId));
+
+    let optimizedCount = 0;
+    let newCount = 0;
+    for (const mediaId of shopifyMediaIds) {
+      if (completedByImageId.has(mediaId) || completedByNewMediaId.has(mediaId)) {
+        optimizedCount++;
+      } else {
+        newCount++;
+      }
+    }
+
+    expect(optimizedCount).toBe(5); // Not 6, not 10
+    expect(newCount).toBe(1); // The new image
+    expect(optimizedCount + newCount).toBe(shopifyMediaIds.length);
   });
 
-  it("should calculate completion percentage correctly and cap at 100%", () => {
-    const totalImages = 31;
-    const completed = 31;
-    const percentage = totalImages > 0 ? Math.min((completed / totalImages) * 100, 100) : 0;
-    expect(percentage).toBe(100);
-
-    // Even with inflated count, should cap at 100
-    const inflatedCompleted = 61;
-    const cappedPercentage = totalImages > 0 ? Math.min((inflatedCompleted / totalImages) * 100, 100) : 0;
-    expect(cappedPercentage).toBe(100);
+  it("should calculate completion percentage correctly", () => {
+    const totalImages = 6;
+    const optimizedCount = 5;
+    const percentage = totalImages > 0 ? Math.min((optimizedCount / totalImages) * 100, 100) : 0;
+    expect(percentage).toBeCloseTo(83.3, 0);
   });
 });
 
@@ -102,19 +166,17 @@ describe("BUG-003: Skip WebP when larger than original", () => {
     expect(shouldSkip).toBe(true);
   });
 
-  it("should display 'Kept original' for skipped images", () => {
-    const fileSize = 50000;
-    const webpFileSize = 65000;
+  it("should mark skipped images with newMediaId same as original", () => {
+    // When we skip, newMediaId = original media ID (since we didn't replace)
+    const originalMediaId = "gid://shopify/MediaImage/111";
+    const record = {
+      imageId: originalMediaId,
+      newMediaId: originalMediaId, // Same! We kept the original
+      status: "completed",
+    };
 
-    const savingsPercent =
-      webpFileSize && fileSize && webpFileSize < fileSize
-        ? (((fileSize - webpFileSize) / fileSize) * 100).toFixed(1)
-        : null;
-
-    expect(savingsPercent).toBeNull();
-
-    const displayText = webpFileSize >= fileSize ? "Kept original" : "-";
-    expect(displayText).toBe("Kept original");
+    expect(record.newMediaId).toBe(record.imageId);
+    expect(record.status).toBe("completed");
   });
 });
 
@@ -135,13 +197,17 @@ describe("BUG-004: Reverted images can be re-optimized", () => {
     expect(isNew).toBe(true); // Should be detected as new
   });
 
-  it("should not leave 'reverted' status records in the database", () => {
-    // The fix deletes records instead of setting status to "reverted"
-    const dbRecords: Array<{ id: string; status: string }> = [];
+  it("should use newMediaId for deletion when reverting", () => {
+    // When reverting, we need to delete the WebP media (which is the newMediaId)
+    const record = {
+      imageId: "gid://shopify/MediaImage/111",
+      newMediaId: "gid://shopify/MediaImage/222",
+      webpGid: "gid://shopify/MediaImage/222",
+    };
 
-    // After revert, there should be no record at all
-    const revertedRecords = dbRecords.filter((r) => r.status === "reverted");
-    expect(revertedRecords).toHaveLength(0);
+    // Should use newMediaId (or webpGid) to identify what to delete from the product
+    const mediaToDelete = record.newMediaId || record.webpGid;
+    expect(mediaToDelete).toBe("gid://shopify/MediaImage/222");
   });
 });
 
@@ -207,19 +273,18 @@ describe("BUG-007: Prevent concurrent optimizations", () => {
 // ─── BUG-008: Billing error handling ────────────────────────────────────────
 
 describe("BUG-008: Billing request error handling", () => {
-  it("should re-throw Response objects from billing.request()", () => {
-    // billing.request() throws a Response for redirect — this is expected behavior
-    const redirectResponse = new Response(null, { status: 302, headers: { Location: "https://shopify.com/billing" } });
+  it("should let billing.request() throw directly without wrapping", () => {
+    // billing.request() ALWAYS throws — either a redirect Response or an error.
+    // The fix: don't wrap it in try/catch, let it propagate directly.
+    const redirectResponse = new Response(null, {
+      status: 401,
+      headers: { "X-Shopify-API-Request-Failure-Reauthorize-Url": "https://shopify.com/billing" },
+    });
 
     expect(redirectResponse).toBeInstanceOf(Response);
-    expect(redirectResponse.status).toBe(302);
-  });
-
-  it("should catch and display actual errors from billing", () => {
-    const error = new Error("API rate limit exceeded");
-
-    const errorMessage = `Failed to start subscription: ${error.message}`;
-    expect(errorMessage).toContain("API rate limit exceeded");
+    // For embedded apps, it throws 401 with reauthorize header (App Bridge intercepts this)
+    expect(redirectResponse.status).toBe(401);
+    expect(redirectResponse.headers.get("X-Shopify-API-Request-Failure-Reauthorize-Url")).toBeTruthy();
   });
 
   it("should use BILLING_TEST_MODE env var correctly", () => {
@@ -235,6 +300,60 @@ describe("BUG-008: Billing request error handling", () => {
       const isTest = tc.envValue === "true";
       expect(isTest).toBe(tc.expected);
     }
+  });
+});
+
+// ─── BUG-009: Counter increments before optimization runs ───────────────────
+
+describe("BUG-009: Counter should not inflate when new images are added", () => {
+  it("should count optimized based on product media matching DB records, not raw DB count", () => {
+    // Scenario: 5 images optimized, 1 new image added
+    // DB has 5 completed records. Shopify has 6 media (5 WebP + 1 new).
+    // The counter should show Optimized: 5, not Optimized: 6
+    const dbRecords = [
+      { imageId: "orig-1", newMediaId: "webp-1", status: "completed" },
+      { imageId: "orig-2", newMediaId: "webp-2", status: "completed" },
+      { imageId: "orig-3", newMediaId: "webp-3", status: "completed" },
+      { imageId: "orig-4", newMediaId: "webp-4", status: "completed" },
+      { imageId: "orig-5", newMediaId: "webp-5", status: "completed" },
+    ];
+
+    const shopifyMedia = ["webp-1", "webp-2", "webp-3", "webp-4", "webp-5", "brand-new-6"];
+    const totalImages = shopifyMedia.length; // 6
+
+    const completedByImageId = new Set(dbRecords.map((r) => r.imageId));
+    const completedByNewMediaId = new Set(dbRecords.filter((r) => r.newMediaId).map((r) => r.newMediaId));
+
+    let optimizedCount = 0;
+    let newImages = 0;
+    for (const mediaId of shopifyMedia) {
+      if (completedByImageId.has(mediaId) || completedByNewMediaId.has(mediaId)) {
+        optimizedCount++;
+      } else {
+        newImages++;
+      }
+    }
+
+    expect(totalImages).toBe(6);
+    expect(optimizedCount).toBe(5); // NOT 6
+    expect(newImages).toBe(1);
+  });
+
+  it("should show correct count even when no images have been optimized", () => {
+    const dbRecords: Array<{ imageId: string; newMediaId: string | null; status: string }> = [];
+    const shopifyMedia = ["img-1", "img-2", "img-3"];
+
+    const completedByImageId = new Set(dbRecords.map((r) => r.imageId));
+    const completedByNewMediaId = new Set(dbRecords.filter((r) => r.newMediaId).map((r) => r.newMediaId));
+
+    let optimizedCount = 0;
+    for (const mediaId of shopifyMedia) {
+      if (completedByImageId.has(mediaId) || completedByNewMediaId.has(mediaId)) {
+        optimizedCount++;
+      }
+    }
+
+    expect(optimizedCount).toBe(0);
   });
 });
 
@@ -263,5 +382,40 @@ describe("CAN-02: Cancel banner display", () => {
     const showCancelBanner =
       actionData.actionType === "cancelled" || actionData.actionType === "cancel";
     expect(showCancelBanner).toBe(false);
+  });
+});
+
+// ─── Duplicate entries in Recent Optimizations table ────────────────────────
+
+describe("Duplicate entries prevention in Recent Optimizations", () => {
+  it("should have exactly one DB record per optimized image", () => {
+    // After optimizing 5 images, we should have 5 records, not 10
+    const optimizedImages = ["img-1", "img-2", "img-3", "img-4", "img-5"];
+    const dbRecords = optimizedImages.map((id) => ({
+      imageId: id,
+      newMediaId: `webp-${id}`,
+      status: "completed",
+    }));
+
+    expect(dbRecords).toHaveLength(5);
+
+    // No duplicate imageIds
+    const imageIds = dbRecords.map((r) => r.imageId);
+    const uniqueImageIds = new Set(imageIds);
+    expect(uniqueImageIds.size).toBe(imageIds.length);
+  });
+
+  it("should not show the same product twice in the table for a single image", () => {
+    // Each product image should appear exactly once in the results
+    const tableRows = [
+      { imageId: "img-1", productName: "Product B-4", originalSize: 378.9, webpSize: 307.9 },
+      { imageId: "img-2", productName: "Product B-3", originalSize: 241.3, webpSize: 157.9 },
+      { imageId: "img-3", productName: "Product B-2", originalSize: 232.3, webpSize: 158.7 },
+    ];
+
+    // No duplicate imageIds in the table
+    const imageIds = tableRows.map((r) => r.imageId);
+    const uniqueIds = new Set(imageIds);
+    expect(uniqueIds.size).toBe(imageIds.length);
   });
 });

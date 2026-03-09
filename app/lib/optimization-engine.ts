@@ -39,6 +39,9 @@ interface ProcessSingleImageParams {
  *
  * BUG-003 FIX: If WebP is larger than original, skip the conversion and mark as completed
  * with a note that the original was kept.
+ *
+ * BUG-009 FIX: Store the new WebP media ID in `newMediaId` field on the SAME record
+ * instead of creating a duplicate record. This prevents double-counting and duplicate rows.
  */
 export async function processSingleImage({
   admin,
@@ -126,6 +129,7 @@ export async function processSingleImage({
         // Store original URL as both original and webp since we're keeping the original
         webpUrl: media.image.url,
         webpGid: media.id,
+        newMediaId: media.id, // Same as original since we didn't replace
         altTextUpdated: false,
       },
     });
@@ -166,11 +170,15 @@ export async function processSingleImage({
   progress.totalSaved += savings;
   progress.processedCount++;
 
+  // BUG-009 FIX: Store newMediaId on the SAME record instead of creating a duplicate.
+  // This single record tracks the full lifecycle: original → optimized.
+  // The newMediaId field lets countImagesToProcess recognize the WebP image on refresh.
   await db.imageOptimization.update({
     where: { shop_imageId: { shop, imageId: media.id } },
     data: {
       webpUrl: newImageUrl || webpResourceUrl,
       webpGid: newMediaId,
+      newMediaId: newMediaId || null,
       backupUrl,
       fileSize: originalSize,
       webpFileSize: webpSize,
@@ -178,37 +186,6 @@ export async function processSingleImage({
       altTextUpdated: seoSettings?.autoApplyOnOptimize ?? false,
     },
   });
-
-  // BUG-001 FIX: Also track the NEW media ID so we can recognize it on refresh
-  // Store a mapping from the new webp media ID to the original record
-  if (newMediaId) {
-    try {
-      await db.imageOptimization.upsert({
-        where: { shop_imageId: { shop, imageId: newMediaId } },
-        create: {
-          shop,
-          productId,
-          imageId: newMediaId,
-          originalUrl: media.image.url,
-          originalGid: media.id,
-          originalAlt: media.image.altText || "",
-          webpUrl: newImageUrl || webpResourceUrl,
-          webpGid: newMediaId,
-          backupUrl,
-          fileSize: originalSize,
-          webpFileSize: webpSize,
-          status: "completed",
-          altTextUpdated: seoSettings?.autoApplyOnOptimize ?? false,
-        },
-        update: {
-          // Already tracked, don't overwrite
-        },
-      });
-    } catch (e) {
-      // Non-critical: just means we already have this record
-      console.log(`Note: Could not create tracking record for new media ${newMediaId}:`, e);
-    }
-  }
 
   // Update job progress
   await db.optimizationJob.update({
@@ -240,7 +217,7 @@ interface RunOptimizationParams {
  * Returns final progress counts.
  *
  * BUG-001 FIX: Skip images that already have a "completed" record in the DB,
- * matching by EITHER the original media ID or the new WebP media ID.
+ * matching by EITHER the original media ID or the newMediaId field.
  *
  * BUG-005 FIX: Add a small delay between images to avoid overwhelming
  * Shopify API and database connections.
@@ -290,13 +267,29 @@ export async function runOptimizationLoop({
         return { ...progress, cancelled: true };
       }
 
-      // BUG-001 FIX: Skip already-completed images (unless retrying)
-      // Check by media ID — this covers both original IDs and new WebP IDs
+      // BUG-001 + BUG-009 FIX: Skip already-completed images (unless retrying)
+      // Check by media ID directly, AND check if any record has this as newMediaId
       if (!isRetry && !targetImageId) {
-        const existing = await db.imageOptimization.findUnique({
+        const existingByImageId = await db.imageOptimization.findUnique({
           where: { shop_imageId: { shop, imageId: media.id } },
         });
-        if (existing && (existing.status === "completed" || existing.status === "processing")) {
+
+        if (existingByImageId && (existingByImageId.status === "completed" || existingByImageId.status === "processing")) {
+          progress.skippedCount++;
+          await db.optimizationJob.update({
+            where: { id: jobId },
+            data: { skippedCount: progress.skippedCount },
+          });
+          continue;
+        }
+
+        // Also check if this media ID is the newMediaId of an existing optimization
+        // (this is the WebP image that replaced an original)
+        const existingByNewMediaId = await db.imageOptimization.findFirst({
+          where: { shop, newMediaId: media.id, status: "completed" },
+        });
+
+        if (existingByNewMediaId) {
           progress.skippedCount++;
           await db.optimizationJob.update({
             where: { id: jobId },
@@ -356,7 +349,7 @@ export async function runOptimizationLoop({
 /**
  * Revert a single optimization record: delete WebP, restore original from backup.
  *
- * BUG-004 FIX: After reverting, DELETE the optimization record(s) from the DB
+ * BUG-004 FIX: After reverting, DELETE the optimization record from the DB
  * so the image is detected as "new" on next refresh and can be re-optimized.
  */
 export async function revertSingleOptimization(
@@ -367,6 +360,7 @@ export async function revertSingleOptimization(
     productId: string;
     imageId: string;
     webpGid: string | null;
+    newMediaId: string | null;
     backupUrl: string | null;
     originalUrl: string;
     originalAlt: string | null;
@@ -374,11 +368,15 @@ export async function revertSingleOptimization(
 ): Promise<void> {
   const restoreSource = opt.backupUrl || opt.originalUrl;
 
-  if (opt.webpGid) {
+  // Delete the WebP media from the product
+  // Use newMediaId if available (the actual current media on the product),
+  // fall back to webpGid
+  const mediaToDelete = opt.newMediaId || opt.webpGid;
+  if (mediaToDelete) {
     try {
-      await deleteProductMedia(admin, opt.productId, [opt.webpGid]);
+      await deleteProductMedia(admin, opt.productId, [mediaToDelete]);
     } catch (e) {
-      console.error(`Warning: Could not delete WebP media ${opt.webpGid}:`, e);
+      console.error(`Warning: Could not delete WebP media ${mediaToDelete}:`, e);
       // Continue with restore even if delete fails
     }
   }
@@ -390,21 +388,6 @@ export async function revertSingleOptimization(
   await db.imageOptimization.delete({
     where: { id: opt.id },
   });
-
-  // Also delete any tracking record for the WebP media ID
-  if (opt.webpGid) {
-    try {
-      await db.imageOptimization.deleteMany({
-        where: {
-          shop: opt.shop,
-          imageId: opt.webpGid,
-        },
-      });
-    } catch (e) {
-      // Non-critical
-      console.log(`Note: No tracking record to delete for ${opt.webpGid}`);
-    }
-  }
 }
 
 // ─── Concurrent Job Guard ─────────────────────────────────────────────────────
@@ -425,17 +408,44 @@ export async function getRunningJob(shop: string) {
 /**
  * Count images that need processing across all products.
  *
- * BUG-001/BUG-002 FIX: Only count images that do NOT have a "completed" record
- * in the database. This prevents double-counting after re-optimization.
+ * BUG-001/BUG-002/BUG-009 FIX: Only count images that do NOT have a "completed"
+ * record in the database. Check both `imageId` (direct match) and `newMediaId`
+ * (the WebP replacement) to avoid double-counting.
+ *
+ * The "Optimized" counter should reflect the number of UNIQUE optimizations,
+ * not the number of DB records.
  */
 export async function countImagesToProcess(
   shop: string,
   products: ShopifyProduct[],
   targetImageId: string | null,
-): Promise<{ totalImages: number; newImages: number; imagesToProcess: number }> {
+): Promise<{ totalImages: number; newImages: number; imagesToProcess: number; optimizedCount: number }> {
   let totalImages = 0;
   let newImages = 0;
   let imagesToProcess = 0;
+  let optimizedCount = 0;
+
+  // Pre-fetch all optimization records for this shop to avoid N+1 queries
+  const allRecords = await db.imageOptimization.findMany({
+    where: { shop },
+    select: { imageId: true, newMediaId: true, status: true },
+  });
+
+  // Build lookup sets for fast checking
+  const completedByImageId = new Set<string>();
+  const completedByNewMediaId = new Set<string>();
+  const failedByImageId = new Set<string>();
+
+  for (const rec of allRecords) {
+    if (rec.status === "completed" || rec.status === "processing") {
+      completedByImageId.add(rec.imageId);
+      if (rec.newMediaId) {
+        completedByNewMediaId.add(rec.newMediaId);
+      }
+    } else if (rec.status === "failed") {
+      failedByImageId.add(rec.imageId);
+    }
+  }
 
   for (const product of products) {
     const mediaImages = getProductImages(product);
@@ -444,23 +454,28 @@ export async function countImagesToProcess(
     for (const media of mediaImages) {
       if (targetImageId && media.id !== targetImageId) continue;
 
-      const existing = await db.imageOptimization.findUnique({
-        where: { shop_imageId: { shop, imageId: media.id } },
-      });
+      // Check if this image is already optimized:
+      // 1. Direct match: this media ID has a completed record
+      // 2. NewMediaId match: this media ID is the WebP replacement of a completed optimization
+      const isCompletedDirectly = completedByImageId.has(media.id);
+      const isCompletedAsWebp = completedByNewMediaId.has(media.id);
 
-      if (!existing) {
-        // Truly new image — no record at all
-        newImages++;
-        imagesToProcess++;
-      } else if (existing.status === "failed") {
+      if (isCompletedDirectly || isCompletedAsWebp) {
+        optimizedCount++;
+        continue;
+      }
+
+      if (failedByImageId.has(media.id)) {
         // Failed images can be retried
         newImages++;
         imagesToProcess++;
+      } else {
+        // Truly new image — no record at all
+        newImages++;
+        imagesToProcess++;
       }
-      // "completed" and "processing" images are NOT counted as new
-      // "reverted" records are deleted (BUG-004 fix), so they won't appear here
     }
   }
 
-  return { totalImages, newImages, imagesToProcess };
+  return { totalImages, newImages, imagesToProcess, optimizedCount };
 }
