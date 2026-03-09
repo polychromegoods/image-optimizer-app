@@ -54,7 +54,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   } catch (error) {
     console.error("[Billing Loader] billing.check error:", error);
-    // Re-throw Response objects (auth redirects etc.)
     if (error instanceof Response) {
       throw error;
     }
@@ -77,23 +76,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const isTest = process.env.BILLING_TEST_MODE === "true";
 
   if (actionType === "subscribe") {
-    // billing.request() ALWAYS throws — it never returns.
-    // For embedded XHR requests: throws a 401 Response with
-    //   X-Shopify-API-Request-Failure-Reauthorize-Url header
-    // App Bridge intercepts this and redirects to the billing approval page.
+    // billing.request() ALWAYS throws a Response — it never returns.
     //
-    // We MUST let this throw propagate up to Remix unhandled.
-    // Do NOT wrap in try/catch — any catch block risks swallowing the Response.
+    // For embedded XHR requests (Remix form submissions with authorization header):
+    //   → throws 401 with X-Shopify-API-Request-Failure-Reauthorize-Url header
+    //   → App Bridge intercepts this and redirects to billing approval page
+    //
+    // The returnUrl is REQUIRED by the GraphQL appSubscriptionCreate mutation.
+    // It must be a full URL where Shopify redirects after the merchant approves/declines.
 
-    console.log("[Billing] Starting billing.request for shop:", session.shop, "isTest:", isTest);
+    const appUrl = process.env.SHOPIFY_APP_URL || `https://${session.shop}/admin/apps/image-compression-webpro`;
+    const returnUrl = `${appUrl}/app/billing`;
 
+    console.log("[Billing] Starting billing.request:", {
+      shop: session.shop,
+      isTest,
+      returnUrl,
+      plan: MONTHLY_PLAN,
+    });
+
+    // Do NOT wrap in try/catch. billing.request() throws a Response that
+    // Remix must pass through to App Bridge. Catching it causes a 500.
     await billing.request({
       plan: MONTHLY_PLAN,
       isTest,
+      returnUrl,
     });
 
-    // This line is unreachable — billing.request() always throws.
-    // But TypeScript needs it for return type.
+    // Unreachable — billing.request() always throws.
     return json({ success: true });
   }
 
