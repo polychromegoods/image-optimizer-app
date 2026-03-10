@@ -5,6 +5,8 @@ import {
   useSubmit,
   useNavigation,
   useActionData,
+  useRouteError,
+  isRouteErrorResponse,
 } from "@remix-run/react";
 import {
   Page,
@@ -295,6 +297,7 @@ export default function ImageOptimizer() {
   // BUG-006 FIX: Track network errors for user-friendly display
   const [networkError, setNetworkError] = useState<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const networkErrorCountRef = useRef(0);
 
   const isSubmitting = navigation.state === "submitting";
   const submittingAction = navigation.formData?.get("action");
@@ -314,6 +317,7 @@ export default function ImageOptimizer() {
     const shouldPoll = (liveJob as Record<string, unknown> | null)?.status === "running" || isOptimizing;
 
     if (shouldPoll && !pollingRef.current) {
+      networkErrorCountRef.current = 0;
       pollingRef.current = setInterval(async () => {
         try {
           const resp = await fetch("/api/optimization-status", {
@@ -322,6 +326,7 @@ export default function ImageOptimizer() {
           if (resp.ok) {
             const data = await resp.json();
             setNetworkError(null); // Clear any previous network error
+            networkErrorCountRef.current = 0; // Reset error count on success
             if (data.hasJob) {
               setLiveJob(data.job);
               if (data.stats) setLiveStats(data.stats);
@@ -334,14 +339,36 @@ export default function ImageOptimizer() {
                 }
               }
             }
+          } else if (resp.status === 401) {
+            // Session expired — stop polling, user needs to refresh
+            console.warn("Polling: session expired (401)");
+            if (pollingRef.current) {
+              clearInterval(pollingRef.current);
+              pollingRef.current = null;
+            }
+            setNetworkError(
+              "Your session has expired. Please refresh the page to continue."
+            );
           }
         } catch (e) {
-          // BUG-006 FIX: Show user-friendly error instead of crashing
-          console.error("Polling error:", e);
+          // ERR-03/BUG-006 FIX: Handle network errors gracefully.
+          // Stop polling after 3 consecutive failures to prevent the error
+          // from propagating to the error boundary and crashing the UI.
+          networkErrorCountRef.current++;
+          console.warn(`Polling error (attempt ${networkErrorCountRef.current}):`, e);
+
           setNetworkError(
-            "Network connection interrupted. The optimization is still running in the background. " +
+            "Network connection interrupted. The optimization may still be running in the background. " +
             "Please check your connection and refresh the page."
           );
+
+          if (networkErrorCountRef.current >= 3) {
+            console.warn("Polling stopped after 3 consecutive network errors");
+            if (pollingRef.current) {
+              clearInterval(pollingRef.current);
+              pollingRef.current = null;
+            }
+          }
         }
       }, POLLING_INTERVAL_MS);
     }
@@ -914,6 +941,46 @@ function OptimizationRow({
         </InlineStack>
       </td>
     </tr>
+  );
+}
+
+// ─── Error Boundary ──────────────────────────────────────────────────────────
+// ERR-03/BUG-006 FIX: Route-level error boundary catches unhandled errors
+// (e.g., network failures during form submission) and shows a friendly message
+// instead of crashing the entire app with "Application Error".
+
+export function ErrorBoundary() {
+  const error = useRouteError();
+  const isNetworkError =
+    error instanceof Error &&
+    (error.message.includes("Failed to fetch") ||
+     error.message.includes("NetworkError") ||
+     error.message.includes("Load failed"));
+
+  const title = isNetworkError ? "Connection Lost" : "Something went wrong";
+  const message = isNetworkError
+    ? "Your network connection was interrupted. The optimization may still be running in the background. Please check your connection and refresh the page."
+    : isRouteErrorResponse(error)
+      ? `${error.status}: ${error.statusText}`
+      : error instanceof Error
+        ? error.message
+        : "An unexpected error occurred. Please refresh the page and try again.";
+
+  return (
+    <Page title="Image Optimizer">
+      <Layout>
+        <Layout.Section>
+          <Banner tone="critical" title={title}>
+            <p>{message}</p>
+          </Banner>
+          <div style={{ marginTop: "16px" }}>
+            <Button url="/app/image-optimizer" variant="primary">
+              Refresh Page
+            </Button>
+          </div>
+        </Layout.Section>
+      </Layout>
+    </Page>
   );
 }
 

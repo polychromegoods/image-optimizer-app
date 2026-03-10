@@ -274,7 +274,7 @@ export async function runOptimizationLoop({
           where: { shop_imageId: { shop, imageId: media.id } },
         });
 
-        if (existingByImageId && (existingByImageId.status === "completed" || existingByImageId.status === "processing")) {
+        if (existingByImageId && existingByImageId.status === "completed") {
           progress.skippedCount++;
           await db.optimizationJob.update({
             where: { id: jobId },
@@ -425,6 +425,20 @@ export async function countImagesToProcess(
   let imagesToProcess = 0;
   let optimizedCount = 0;
 
+  // OPT-05 FIX: Clean up stale "processing" records that were left behind
+  // by cancelled or crashed optimizations. These should not inflate the counter.
+  // Only clean up records that are NOT part of a currently running job.
+  const runningJob = await db.optimizationJob.findFirst({
+    where: { shop, status: "running" },
+  });
+
+  if (!runningJob) {
+    // No job running — any "processing" records are stale, reset them to allow re-processing
+    await db.imageOptimization.deleteMany({
+      where: { shop, status: "processing" },
+    });
+  }
+
   // Pre-fetch all optimization records for this shop to avoid N+1 queries
   const allRecords = await db.imageOptimization.findMany({
     where: { shop },
@@ -432,12 +446,13 @@ export async function countImagesToProcess(
   });
 
   // Build lookup sets for fast checking
+  // OPT-05 FIX: Only count "completed" status as optimized, NOT "processing"
   const completedByImageId = new Set<string>();
   const completedByNewMediaId = new Set<string>();
   const failedByImageId = new Set<string>();
 
   for (const rec of allRecords) {
-    if (rec.status === "completed" || rec.status === "processing") {
+    if (rec.status === "completed") {
       completedByImageId.add(rec.imageId);
       if (rec.newMediaId) {
         completedByNewMediaId.add(rec.newMediaId);
