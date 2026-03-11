@@ -1,15 +1,15 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "245ba33ff3fdd13456646e458c9332e0"
+client_id = "4a46138e7f8e55882a7bde0cb63dab1c"
 name = "Image Compression WebPro"
 application_url = "https://image-optimizer-app-production.up.railway.app"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
 
 [webhooks]
-api_version = "2026-04"
+api_version = "2026-01"
 
   [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
@@ -19,9 +19,25 @@ api_version = "2026-04"
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
 
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request"]
+  uri = "/webhooks/customers/data_request"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/redact"]
+  uri = "/webhooks/customers/redact"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["shop/redact"]
+  uri = "/webhooks/shop/redact"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_files,read_products,write_files,write_products"
 
 [auth]
-redirect_urls = [ "https://image-optimizer-app-production.up.railway.app/auth/callback" ]
+redirect_urls = [
+  "https://image-optimizer-app-production.up.railway.app/auth/callback",
+  "https://image-optimizer-app-production.up.railway.app/auth/shopify/callback",
+  "https://image-optimizer-app-production.up.railway.app/api/auth/callback"
+]
