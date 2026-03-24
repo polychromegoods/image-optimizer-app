@@ -75,6 +75,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const productsData = await productsResponse.json();
   const products = parseProductsResponse(productsData);
 
+  console.log(`[Loader] Shop: ${shop}, Products fetched: ${products.length}`);
+  for (const p of products) {
+    const mediaEdges = p.media?.edges || [];
+    const imageMedia = mediaEdges.filter((e: any) => e.node?.mediaContentType === "IMAGE");
+    console.log(`[Loader] Product: "${p.title}" (${p.id}), total media: ${mediaEdges.length}, image media: ${imageMedia.length}`);
+  }
+
   const { totalImages, newImages, optimizedCount } = await countImagesToProcess(shop, products, null);
 
   return json<LoaderData>({

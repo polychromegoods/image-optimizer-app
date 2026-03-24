@@ -425,6 +425,8 @@ export async function countImagesToProcess(
   let imagesToProcess = 0;
   let optimizedCount = 0;
 
+  console.log(`[countImagesToProcess] shop=${shop}, products=${products.length}, targetImageId=${targetImageId}`);
+
   // OPT-05 FIX: Clean up stale "processing" records that were left behind
   // by cancelled or crashed optimizations. These should not inflate the counter.
   // Only clean up records that are NOT part of a currently running job.
@@ -464,6 +466,7 @@ export async function countImagesToProcess(
 
   for (const product of products) {
     const mediaImages = getProductImages(product);
+    console.log(`[countImagesToProcess] Product "${product.title}" (${product.id}): ${mediaImages.length} images, raw media edges: ${product.media?.edges?.length || 0}`);
     totalImages += mediaImages.length;
 
     for (const media of mediaImages) {
@@ -492,5 +495,6 @@ export async function countImagesToProcess(
     }
   }
 
+  console.log(`[countImagesToProcess] RESULT: totalImages=${totalImages}, newImages=${newImages}, imagesToProcess=${imagesToProcess}, optimizedCount=${optimizedCount}`);
   return { totalImages, newImages, imagesToProcess, optimizedCount };
 }
