@@ -303,10 +303,13 @@ export default function ImageOptimizer() {
     (isSubmitting && submittingAction === "optimize_new") ||
     (liveJob as Record<string, unknown> | null)?.status === "running";
   const isRefreshing = isSubmitting && submittingAction === "refresh";
-  const isReverting =
-    isSubmitting &&
-    (submittingAction === "revert_all" || submittingAction === "revert_single");
-  const isRetrying = isSubmitting && submittingAction === "retry_single";
+  const isRevertingAll = isSubmitting && submittingAction === "revert_all";
+  const revertingId = isSubmitting && submittingAction === "revert_single"
+    ? (navigation.formData?.get("optimizationId") as string | null)
+    : null;
+  const retryingImageId = isSubmitting && submittingAction === "retry_single"
+    ? (navigation.formData?.get("imageId") as string | null)
+    : null;
   const isCancelling = isSubmitting && submittingAction === "cancel";
 
   // ── Polling for live updates during optimization ──
@@ -566,7 +569,7 @@ export default function ImageOptimizer() {
                                 <Button
                                   tone="critical"
                                   onClick={() => setShowRevertModal(true)}
-                                  loading={isReverting}
+                                  loading={isRevertingAll}
                                 >
                                   Revert All to Originals
                                 </Button>
@@ -580,8 +583,9 @@ export default function ImageOptimizer() {
                       <OptimizationsTable
                         optimizations={recentOptimizations}
                         productMap={productMap}
-                        isReverting={isReverting}
-                        isRetrying={isRetrying}
+                        revertingId={revertingId}
+                        retryingImageId={retryingImageId}
+                        isRevertingAll={isRevertingAll}
                         onCompare={setCompareImage}
                         onRevert={handleRevertSingle}
                         onRetry={handleRetrySingle}
@@ -793,16 +797,18 @@ function LiveProgressCard({
 function OptimizationsTable({
   optimizations,
   productMap,
-  isReverting,
-  isRetrying,
+  revertingId,
+  retryingImageId,
+  isRevertingAll,
   onCompare,
   onRevert,
   onRetry,
 }: {
   optimizations: Array<Record<string, unknown>>;
   productMap: Record<string, string>;
-  isReverting: boolean;
-  isRetrying: boolean;
+  revertingId: string | null;
+  retryingImageId: string | null;
+  isRevertingAll: boolean;
   onCompare: (opt: Record<string, unknown>) => void;
   onRevert: (id: string) => void;
   onRetry: (imageId: string) => void;
@@ -834,8 +840,8 @@ function OptimizationsTable({
                       productMap[opt.productId as string] ||
                       extractIdFromGid(opt.productId as string)
                     }
-                    isReverting={isReverting}
-                    isRetrying={isRetrying}
+                    isRowReverting={revertingId === (opt.id as string) || isRevertingAll}
+                    isRowRetrying={retryingImageId === (opt.imageId as string)}
                     onCompare={onCompare}
                     onRevert={onRevert}
                     onRetry={onRetry}
@@ -857,16 +863,16 @@ function OptimizationsTable({
 function OptimizationRow({
   opt,
   productName,
-  isReverting,
-  isRetrying,
+  isRowReverting,
+  isRowRetrying,
   onCompare,
   onRevert,
   onRetry,
 }: {
   opt: Record<string, unknown>;
   productName: string;
-  isReverting: boolean;
-  isRetrying: boolean;
+  isRowReverting: boolean;
+  isRowRetrying: boolean;
   onCompare: (opt: Record<string, unknown>) => void;
   onRevert: (id: string) => void;
   onRetry: (imageId: string) => void;
@@ -960,7 +966,7 @@ function OptimizationRow({
                 size="slim"
                 tone="critical"
                 onClick={() => onRevert(opt.id as string)}
-                loading={isReverting}
+                loading={isRowReverting}
               >
                 Revert
               </Button>
@@ -971,7 +977,7 @@ function OptimizationRow({
               size="slim"
               variant="primary"
               onClick={() => onRetry(opt.imageId as string)}
-              loading={isRetrying}
+              loading={isRowRetrying}
             >
               Retry
             </Button>
