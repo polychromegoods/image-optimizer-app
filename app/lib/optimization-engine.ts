@@ -149,21 +149,44 @@ export async function processSingleImage({
   const backupFilename = `backup-${extractIdFromGid(media.id)}.${extension}`;
   const backupMimeType = getMimeType(extension);
 
-  const backupUrl = await uploadBackupToFiles(admin, imageBuffer, backupFilename, backupMimeType);
+  let backupUrl: string;
+  try {
+    backupUrl = await uploadBackupToFiles(admin, imageBuffer, backupFilename, backupMimeType);
+  } catch (backupError) {
+    console.error(`Failed to backup original for ${media.id}, aborting optimization:`, backupError);
+    throw new Error(`Backup failed for ${media.id}: ${backupError instanceof Error ? backupError.message : String(backupError)}`);
+  }
 
-  // Step 4: Upload WebP
-  const webpResourceUrl = await uploadWebpImage(admin, webpBuffer, fileName);
+  // Step 4: Upload WebP (BEFORE deleting original — safe optimization)
+  let webpResourceUrl: string;
+  try {
+    webpResourceUrl = await uploadWebpImage(admin, webpBuffer, fileName);
+  } catch (uploadError) {
+    console.error(`Failed to upload WebP for ${media.id}, aborting (original preserved):`, uploadError);
+    throw new Error(`WebP upload failed for ${media.id}: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}`);
+  }
 
-  // Step 5: Delete original product media
-  await deleteProductMedia(admin, productId, [media.id]);
+  // Step 5: Create new product media with WebP FIRST (before deleting original)
+  // This ensures the product always has images even if something fails
+  let newMediaId: string | null;
+  let newImageUrl: string | null;
+  try {
+    const result = await createProductMedia(admin, productId, webpResourceUrl, altText);
+    newMediaId = result.mediaId;
+    newImageUrl = result.imageUrl;
+  } catch (createError) {
+    console.error(`Failed to create WebP media on product for ${media.id}, aborting (original preserved):`, createError);
+    throw new Error(`Media creation failed for ${media.id}: ${createError instanceof Error ? createError.message : String(createError)}`);
+  }
 
-  // Step 6: Create new product media with WebP
-  const { mediaId: newMediaId, imageUrl: newImageUrl } = await createProductMedia(
-    admin,
-    productId,
-    webpResourceUrl,
-    altText,
-  );
+  // Step 6: Delete original product media ONLY after WebP is successfully attached
+  try {
+    await deleteProductMedia(admin, productId, [media.id]);
+  } catch (deleteError) {
+    // Non-fatal: the product now has both original and WebP
+    // We still record the optimization as completed
+    console.warn(`Warning: Could not delete original media ${media.id} (product may have duplicate):`, deleteError);
+  }
 
   // Step 7: Update database record
   const savings = originalSize - webpSize;
@@ -368,26 +391,40 @@ export async function revertSingleOptimization(
 ): Promise<void> {
   const restoreSource = opt.backupUrl || opt.originalUrl;
 
-  // Delete the WebP media from the product
-  // Use newMediaId if available (the actual current media on the product),
-  // fall back to webpGid
+  if (!restoreSource) {
+    console.error(`Cannot revert ${opt.imageId}: no backup URL or original URL available`);
+    // Still clean up the DB record so it doesn't block future operations
+    await db.imageOptimization.delete({ where: { id: opt.id } });
+    return;
+  }
+
+  // SAFE REVERT: Restore original FIRST, then delete WebP
+  // This ensures the product always has at least one image
+  console.log(`[Revert] Restoring original for ${opt.imageId} from: ${restoreSource}`);
+  try {
+    await createProductMedia(admin, opt.productId, restoreSource, opt.originalAlt || "");
+  } catch (restoreError) {
+    console.error(`Failed to restore original for ${opt.imageId}:`, restoreError);
+    throw new Error(`Revert failed: could not restore original image. WebP version preserved. Error: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+  }
+
+  // Now delete the WebP media (safe because original is already restored)
   const mediaToDelete = opt.newMediaId || opt.webpGid;
   if (mediaToDelete) {
     try {
       await deleteProductMedia(admin, opt.productId, [mediaToDelete]);
     } catch (e) {
-      console.error(`Warning: Could not delete WebP media ${mediaToDelete}:`, e);
-      // Continue with restore even if delete fails
+      // Non-fatal: product now has both original and WebP
+      console.warn(`Warning: Could not delete WebP media ${mediaToDelete} (product may have duplicate):`, e);
     }
   }
-
-  await createProductMedia(admin, opt.productId, restoreSource, opt.originalAlt || "");
 
   // BUG-004 FIX: Delete the optimization record so the restored image
   // will be detected as "new" on next refresh
   await db.imageOptimization.delete({
     where: { id: opt.id },
   });
+  console.log(`[Revert] Successfully reverted ${opt.imageId}`);
 }
 
 // ─── Concurrent Job Guard ─────────────────────────────────────────────────────

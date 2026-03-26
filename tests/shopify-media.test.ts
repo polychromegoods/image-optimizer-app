@@ -75,7 +75,7 @@ describe("getProductImages", () => {
 // ─── parseProductsResponse ─────────────────────────────────────────────────────
 
 describe("parseProductsResponse", () => {
-  it("parses a standard Shopify GraphQL products response", () => {
+  it("parses a standard Shopify GraphQL products response with pageInfo", () => {
     const data = {
       data: {
         products: {
@@ -101,24 +101,32 @@ describe("parseProductsResponse", () => {
               },
             },
           ],
+          pageInfo: {
+            hasNextPage: true,
+            endCursor: "cursor123",
+          },
         },
       },
     };
 
-    const products = parseProductsResponse(data);
-    expect(products).toHaveLength(2);
-    expect(products[0].title).toBe("Product A");
-    expect(products[1].title).toBe("Product B");
+    const result = parseProductsResponse(data);
+    expect(result.products).toHaveLength(2);
+    expect(result.products[0].title).toBe("Product A");
+    expect(result.products[1].title).toBe("Product B");
+    expect(result.pageInfo.hasNextPage).toBe(true);
+    expect(result.pageInfo.endCursor).toBe("cursor123");
   });
 
-  it("returns empty array for empty response", () => {
-    expect(parseProductsResponse({})).toEqual([]);
-    expect(parseProductsResponse({ data: {} })).toEqual([]);
-    expect(parseProductsResponse({ data: { products: {} } })).toEqual([]);
-    expect(parseProductsResponse({ data: { products: { edges: [] } } })).toEqual([]);
+  it("returns empty products and default pageInfo for empty response", () => {
+    const defaultPageInfo = { hasNextPage: false, endCursor: null };
+    expect(parseProductsResponse({}).products).toEqual([]);
+    expect(parseProductsResponse({}).pageInfo).toEqual(defaultPageInfo);
+    expect(parseProductsResponse({ data: {} }).products).toEqual([]);
+    expect(parseProductsResponse({ data: { products: {} } }).products).toEqual([]);
+    expect(parseProductsResponse({ data: { products: { edges: [] } } }).products).toEqual([]);
   });
 
-  it("returns empty array for null data", () => {
-    expect(parseProductsResponse({ data: null } as unknown as Record<string, unknown>)).toEqual([]);
+  it("returns empty products for null data", () => {
+    expect(parseProductsResponse({ data: null } as unknown as Record<string, unknown>).products).toEqual([]);
   });
 });

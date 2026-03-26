@@ -3,8 +3,8 @@
 /** WebP quality setting (0-100). 85 provides a good balance of quality and size. */
 export const WEBP_QUALITY = 85;
 
-/** Maximum number of products to fetch per GraphQL query. */
-export const MAX_PRODUCTS_PER_QUERY = 250;
+/** Maximum number of products to fetch per GraphQL page. */
+export const PRODUCTS_PER_PAGE = 250;
 
 /** Maximum number of media items to fetch per product. */
 export const MAX_MEDIA_PER_PRODUCT = 50;
@@ -18,9 +18,10 @@ export const POLLING_INTERVAL_MS = 2000;
 // ─── GraphQL Queries ───────────────────────────────────────────────────────────
 
 export const QUERY_PRODUCTS_WITH_MEDIA = `#graphql
-  query getProducts($first: Int!) {
-    products(first: $first) {
+  query getProducts($first: Int!, $after: String) {
+    products(first: $first, after: $after) {
       edges {
+        cursor
         node {
           id
           title
@@ -39,6 +40,10 @@ export const QUERY_PRODUCTS_WITH_MEDIA = `#graphql
             }
           }
         }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }

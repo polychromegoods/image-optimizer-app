@@ -4,6 +4,8 @@ import {
   MUTATION_FILE_CREATE,
   MUTATION_PRODUCT_DELETE_MEDIA,
   MUTATION_PRODUCT_CREATE_MEDIA,
+  QUERY_PRODUCTS_WITH_MEDIA,
+  PRODUCTS_PER_PAGE,
 } from "./constants";
 
 // ─── Staged Upload Helpers ─────────────────────────────────────────────────────
@@ -174,8 +176,54 @@ export function getProductImages(product: ShopifyProduct): ShopifyMediaImage[] {
 
 /**
  * Parse the products array from a Shopify GraphQL response.
+ * Returns both products and pagination info.
  */
-export function parseProductsResponse(data: Record<string, unknown>): ShopifyProduct[] {
-  const productsData = data as { data?: { products?: { edges?: Array<{ node: ShopifyProduct }> } } };
-  return productsData.data?.products?.edges?.map((e) => e.node) || [];
+export function parseProductsResponse(data: Record<string, unknown>): {
+  products: ShopifyProduct[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+} {
+  const productsData = data as {
+    data?: {
+      products?: {
+        edges?: Array<{ node: ShopifyProduct }>;
+        pageInfo?: { hasNextPage: boolean; endCursor: string | null };
+      };
+    };
+  };
+  return {
+    products: productsData.data?.products?.edges?.map((e) => e.node) || [],
+    pageInfo: productsData.data?.products?.pageInfo || { hasNextPage: false, endCursor: null },
+  };
+}
+
+/**
+ * Fetch ALL products from the store using cursor-based pagination.
+ * This ensures stores with >250 products have all images detected.
+ */
+export async function fetchAllProducts(admin: ShopifyAdmin): Promise<ShopifyProduct[]> {
+  const allProducts: ShopifyProduct[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageNum = 0;
+
+  while (hasNextPage) {
+    pageNum++;
+    const variables: Record<string, unknown> = { first: PRODUCTS_PER_PAGE };
+    if (cursor) variables.after = cursor;
+
+    console.log(`[fetchAllProducts] Fetching page ${pageNum}, cursor: ${cursor || "(start)"}`);
+
+    const response = await admin.graphql(QUERY_PRODUCTS_WITH_MEDIA, { variables });
+    const data = await response.json();
+    const { products, pageInfo } = parseProductsResponse(data);
+
+    allProducts.push(...products);
+    hasNextPage = pageInfo.hasNextPage;
+    cursor = pageInfo.endCursor;
+
+    console.log(`[fetchAllProducts] Page ${pageNum}: ${products.length} products (total so far: ${allProducts.length}, hasNextPage: ${hasNextPage})`);
+  }
+
+  console.log(`[fetchAllProducts] Complete: ${allProducts.length} total products across ${pageNum} page(s)`);
+  return allProducts;
 }

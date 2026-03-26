@@ -29,14 +29,12 @@ import db from "../db.server";
 
 import type { LoaderData, StatsMap, ActionResult } from "../lib/types";
 import {
-  QUERY_PRODUCTS_WITH_MEDIA,
   QUERY_SHOP_NAME,
-  MAX_PRODUCTS_PER_QUERY,
   RECENT_OPTIMIZATIONS_LIMIT,
   POLLING_INTERVAL_MS,
 } from "../lib/constants";
 import { extractIdFromGid } from "../lib/templates";
-import { parseProductsResponse, getProductImages } from "../lib/shopify-media";
+import { fetchAllProducts, getProductImages } from "../lib/shopify-media";
 import {
   runOptimizationLoop,
   revertSingleOptimization,
@@ -50,7 +48,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [stats, recentOptimizations, seoSettings, activeJob, productsResponse] =
+  // Fetch DB data in parallel, then fetch all products with pagination
+  const [stats, recentOptimizations, seoSettings, activeJob] =
     await Promise.all([
       db.imageOptimization.groupBy({
         by: ["status"],
@@ -67,20 +66,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         where: { shop, status: "running" },
         orderBy: { createdAt: "desc" },
       }),
-      admin.graphql(QUERY_PRODUCTS_WITH_MEDIA, {
-        variables: { first: MAX_PRODUCTS_PER_QUERY },
-      }),
     ]);
 
-  const productsData = await productsResponse.json();
-  const products = parseProductsResponse(productsData);
+  // Fetch ALL products with cursor-based pagination (handles >250 products)
+  const products = await fetchAllProducts(admin);
 
   console.log(`[Loader] Shop: ${shop}, Products fetched: ${products.length}`);
-  for (const p of products) {
-    const mediaEdges = p.media?.edges || [];
-    const imageMedia = mediaEdges.filter((e: any) => e.node?.mediaContentType === "IMAGE");
-    console.log(`[Loader] Product: "${p.title}" (${p.id}), total media: ${mediaEdges.length}, image media: ${imageMedia.length}`);
-  }
 
   const { totalImages, newImages, optimizedCount } = await countImagesToProcess(shop, products, null);
 
@@ -143,19 +134,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     }
 
-    const [seoSettings, shopResponse, productsResponse] = await Promise.all([
+    const [seoSettings, shopResponse] = await Promise.all([
       db.seoSettings.findUnique({ where: { shop } }),
       admin.graphql(QUERY_SHOP_NAME),
-      admin.graphql(QUERY_PRODUCTS_WITH_MEDIA, {
-        variables: { first: MAX_PRODUCTS_PER_QUERY },
-      }),
     ]);
 
     const shopData = await shopResponse.json();
     const shopName = (shopData as { data?: { shop?: { name?: string } } }).data?.shop?.name || shop;
 
-    const productsData = await productsResponse.json();
-    const products = parseProductsResponse(productsData);
+    // Fetch ALL products with pagination
+    const products = await fetchAllProducts(admin);
 
     // Count images to process
     const { imagesToProcess } = await countImagesToProcess(shop, products, targetImageId);

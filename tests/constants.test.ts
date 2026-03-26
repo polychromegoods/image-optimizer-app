@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   WEBP_QUALITY,
-  MAX_PRODUCTS_PER_QUERY,
+  PRODUCTS_PER_PAGE,
   MAX_MEDIA_PER_PRODUCT,
   RECENT_OPTIMIZATIONS_LIMIT,
   POLLING_INTERVAL_MS,
@@ -20,9 +20,9 @@ describe("Configuration constants", () => {
     expect(WEBP_QUALITY).toBeLessThanOrEqual(100);
   });
 
-  it("MAX_PRODUCTS_PER_QUERY is a positive integer", () => {
-    expect(MAX_PRODUCTS_PER_QUERY).toBeGreaterThan(0);
-    expect(Number.isInteger(MAX_PRODUCTS_PER_QUERY)).toBe(true);
+  it("PRODUCTS_PER_PAGE is a positive integer", () => {
+    expect(PRODUCTS_PER_PAGE).toBeGreaterThan(0);
+    expect(Number.isInteger(PRODUCTS_PER_PAGE)).toBe(true);
   });
 
   it("MAX_MEDIA_PER_PRODUCT is a positive integer", () => {
