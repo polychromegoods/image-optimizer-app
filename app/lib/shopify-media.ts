@@ -73,8 +73,8 @@ export async function uploadBackupToFiles(
   const target = await createStagedUpload(admin, "FILE", filename, mimeType);
   await uploadToStagedTarget(target, buffer, filename, mimeType);
 
-  // Register the file in Shopify's file storage
-  await admin.graphql(MUTATION_FILE_CREATE, {
+  // Register the file in Shopify's file storage and verify it succeeded
+  const fileCreateResponse = await admin.graphql(MUTATION_FILE_CREATE, {
     variables: {
       files: [
         {
@@ -86,6 +86,25 @@ export async function uploadBackupToFiles(
     },
   });
 
+  const fileCreateData = await fileCreateResponse.json();
+  const fileCreateErrors = (fileCreateData as any).data?.fileCreate?.userErrors;
+  if (fileCreateErrors?.length > 0) {
+    const errorMsg = fileCreateErrors.map((e: { message: string }) => e.message).join(", ");
+    throw new Error(`Backup fileCreate failed for ${filename}: ${errorMsg}`);
+  }
+
+  // Try to extract the permanent Shopify Files URL from the response
+  const createdFile = (fileCreateData as any).data?.fileCreate?.files?.[0];
+  const permanentUrl = createdFile?.image?.url || createdFile?.url || null;
+
+  // Return the permanent URL if available, otherwise fall back to resourceUrl
+  // The resourceUrl from staged uploads may expire, but the permanent URL won't
+  if (permanentUrl) {
+    console.log(`[Backup] Stored permanent URL for ${filename}: ${permanentUrl}`);
+    return permanentUrl;
+  }
+
+  console.warn(`[Backup] Could not extract permanent URL for ${filename}, using resourceUrl as fallback`);
   return target.resourceUrl;
 }
 
@@ -155,10 +174,17 @@ export async function createProductMedia(
   }
 
   const newMedia = data.data?.productCreateMedia?.media?.[0];
-  return {
-    mediaId: newMedia?.id || null,
-    imageUrl: newMedia?.image?.url || null,
-  };
+  const mediaId = newMedia?.id || null;
+  const imageUrl = newMedia?.image?.url || null;
+
+  // SAFETY: If Shopify returned no media ID, the image was not actually attached
+  // to the product. Treat this as a failure to prevent silent data loss.
+  if (!mediaId) {
+    console.error(`[createProductMedia] Shopify returned no media ID for product ${productId}. Response:`, JSON.stringify(data.data?.productCreateMedia));
+    throw new Error(`Product media creation returned no media ID for product ${productId}. The image may not have been attached.`);
+  }
+
+  return { mediaId, imageUrl };
 }
 
 // ─── Product Parsing Helpers ───────────────────────────────────────────────────

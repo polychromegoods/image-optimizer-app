@@ -71,7 +71,10 @@ export const MUTATION_STAGED_UPLOADS_CREATE = `#graphql
 export const MUTATION_FILE_CREATE = `#graphql
   mutation fileCreate($files: [FileCreateInput!]!) {
     fileCreate(files: $files) {
-      files { ... on MediaImage { id image { url } } }
+      files {
+        ... on MediaImage { id image { url } }
+        ... on GenericFile { id url }
+      }
       userErrors { field message }
     }
   }

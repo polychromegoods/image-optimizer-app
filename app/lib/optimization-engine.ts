@@ -429,11 +429,47 @@ export async function revertSingleOptimization(
 
 // ─── Concurrent Job Guard ─────────────────────────────────────────────────────
 
+// Maximum time (in minutes) a job can stay in "running" status before being considered stale
+const STALE_JOB_TIMEOUT_MINUTES = 15;
+
 /**
  * BUG-007 FIX: Check if there's already a running optimization job for this shop.
  * Returns the running job if one exists, null otherwise.
+ *
+ * SAFETY: Also cleans up stale jobs that have been "running" for too long
+ * (e.g., server crash during optimization). This prevents permanently blocked stores.
  */
 export async function getRunningJob(shop: string) {
+  const staleThreshold = new Date(Date.now() - STALE_JOB_TIMEOUT_MINUTES * 60 * 1000);
+
+  // First, clean up any stale "running" jobs that haven't been updated recently
+  const staleJobs = await db.optimizationJob.findMany({
+    where: {
+      shop,
+      status: "running",
+      updatedAt: { lt: staleThreshold },
+    },
+  });
+
+  if (staleJobs.length > 0) {
+    console.warn(`[StaleJobCleanup] Found ${staleJobs.length} stale running job(s) for ${shop}, marking as failed`);
+    for (const job of staleJobs) {
+      await db.optimizationJob.update({
+        where: { id: job.id },
+        data: {
+          status: "failed",
+          currentImage: "Job timed out (server may have restarted)",
+        },
+      });
+    }
+
+    // Also clean up any "processing" records left by the stale job
+    await db.imageOptimization.deleteMany({
+      where: { shop, status: "processing" },
+    });
+  }
+
+  // Now check for a genuinely running job
   return db.optimizationJob.findFirst({
     where: { shop, status: "running" },
     orderBy: { createdAt: "desc" },

@@ -54,6 +54,7 @@ model ImageOptimization {
 
   @@unique([shop, imageId])
   @@index([shop, status])
+  @@index([shop, newMediaId])
 }
 
 model OptimizationJob {
