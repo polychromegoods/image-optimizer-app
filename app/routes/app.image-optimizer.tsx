@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
+import { json, defer } from "@remix-run/node";
 import {
   useLoaderData,
   useSubmit,
@@ -7,6 +7,7 @@ import {
   useActionData,
   useRouteError,
   isRouteErrorResponse,
+  Await,
 } from "@remix-run/react";
 import {
   Page,
@@ -22,8 +23,10 @@ import {
   Modal,
   Thumbnail,
   Spinner,
+  SkeletonBodyText,
+  SkeletonDisplayText,
 } from "@shopify/polaris";
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, Suspense } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 
@@ -48,7 +51,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  // Fetch DB data in parallel, then fetch all products with pagination
+  // Fast DB queries — return immediately with the page shell
   const [stats, recentOptimizations, seoSettings, activeJob] =
     await Promise.all([
       db.imageOptimization.groupBy({
@@ -68,23 +71,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }),
     ]);
 
-  // Fetch ALL products with cursor-based pagination (handles >250 products)
-  const products = await fetchAllProducts(admin);
+  // Slow product fetch — defer so the page renders immediately
+  const productDataPromise = fetchAllProducts(admin).then(async (products) => {
+    console.log(`[Loader] Shop: ${shop}, Products fetched: ${products.length}`);
+    const counts = await countImagesToProcess(shop, products, null);
+    return {
+      products,
+      totalImages: counts.totalImages,
+      newImages: counts.newImages,
+      optimizedCount: counts.optimizedCount,
+    };
+  });
 
-  console.log(`[Loader] Shop: ${shop}, Products fetched: ${products.length}`);
-
-  const { totalImages, newImages, optimizedCount } = await countImagesToProcess(shop, products, null);
-
-  return json<LoaderData>({
+  return defer({
     shop,
     stats,
     recentOptimizations: recentOptimizations as LoaderData["recentOptimizations"],
-    products,
-    totalImages,
-    newImages,
-    optimizedCount,
     seoSettings,
     activeJob,
+    productData: productDataPromise,
   });
 };
 
@@ -269,12 +274,9 @@ export default function ImageOptimizer() {
   const {
     stats: initialStats,
     recentOptimizations: initialOptimizations,
-    products,
-    totalImages,
-    newImages,
-    optimizedCount,
     seoSettings,
     activeJob: initialActiveJob,
+    productData,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>() as ActionResult | undefined;
   const submit = useSubmit();
@@ -320,63 +322,47 @@ export default function ImageOptimizer() {
           });
           if (resp.ok) {
             const data = await resp.json();
-            setNetworkError(null); // Clear any previous network error
-            networkErrorCountRef.current = 0; // Reset error count on success
+            networkErrorCountRef.current = 0;
+            setNetworkError(null);
+
             if (data.hasJob) {
               setLiveJob(data.job);
-              if (data.stats) setLiveStats(data.stats);
-              if (data.recentOptimizations) setLiveOptimizations(data.recentOptimizations);
+              setLiveStats(data.stats);
+              setLiveOptimizations(data.recentOptimizations);
 
-              if (data.job.status === "completed" || data.job.status === "cancelled") {
+              if (data.job.status !== "running") {
                 if (pollingRef.current) {
                   clearInterval(pollingRef.current);
                   pollingRef.current = null;
                 }
               }
             }
-          } else if (resp.status === 401) {
-            // Session expired — stop polling, user needs to refresh
-            console.warn("Polling: session expired (401)");
-            if (pollingRef.current) {
-              clearInterval(pollingRef.current);
-              pollingRef.current = null;
-            }
-            setNetworkError(
-              "Your session has expired. Please refresh the page to continue."
-            );
           }
-        } catch (e) {
-          // ERR-03/BUG-006 FIX: Handle network errors gracefully.
-          // Stop polling after 3 consecutive failures to prevent the error
-          // from propagating to the error boundary and crashing the UI.
+        } catch (err) {
           networkErrorCountRef.current++;
-          console.warn(`Polling error (attempt ${networkErrorCountRef.current}):`, e);
-
-          setNetworkError(
-            "Network connection interrupted. The optimization may still be running in the background. " +
-            "Please check your connection and refresh the page."
-          );
-
           if (networkErrorCountRef.current >= 3) {
-            console.warn("Polling stopped after 3 consecutive network errors");
-            if (pollingRef.current) {
-              clearInterval(pollingRef.current);
-              pollingRef.current = null;
-            }
+            setNetworkError(
+              "Having trouble connecting to the server. The optimization may still be running. Please wait or refresh the page.",
+            );
           }
         }
       }, POLLING_INTERVAL_MS);
     }
 
+    if (!shouldPoll && pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+
     return () => {
-      if (pollingRef.current && !isOptimizing && (liveJob as Record<string, unknown> | null)?.status !== "running") {
+      if (pollingRef.current) {
         clearInterval(pollingRef.current);
         pollingRef.current = null;
       }
     };
-  }, [isOptimizing, (liveJob as Record<string, unknown> | null)?.status]);
+  }, [liveJob, isOptimizing]);
 
-  // Sync loader data into live state
+  // Sync loader data when it changes (e.g., after form submission)
   useEffect(() => {
     setLiveStats(initialStats);
     setLiveOptimizations(initialOptimizations);
@@ -404,9 +390,6 @@ export default function ImageOptimizer() {
     },
     { pending: 0, processing: 0, completed: 0, failed: 0, reverted: 0 },
   );
-
-  // BUG-002/BUG-009 FIX: Use optimizedCount from countImagesToProcess (deduped, accurate)
-  const completionPercentage = totalImages > 0 ? Math.min((optimizedCount / totalImages) * 100, 100) : 0;
 
   const job = liveJob as Record<string, number | string | null> | null;
   const jobProgress =
@@ -458,12 +441,6 @@ export default function ImageOptimizer() {
     if (job?.id) fd.append("jobId", job.id as string);
     submit(fd, { method: "post" });
   };
-
-  // Product name lookup
-  const productMap: Record<string, string> = {};
-  for (const p of products) {
-    productMap[p.id] = p.title;
-  }
 
   // ── Render ──
 
@@ -526,61 +503,94 @@ export default function ImageOptimizer() {
               </BlockStack>
             </Card>
 
-            {newImages > 0 && !isOptimizing && (
-              <Banner tone="info">
-                <p>
-                  Found {newImages} new image{newImages !== 1 ? "s" : ""} ready to optimize.
-                </p>
-              </Banner>
-            )}
+            {/* Deferred product data — shows skeleton while loading */}
+            <Suspense fallback={<ProductDataSkeleton />}>
+              <Await
+                resolve={productData}
+                errorElement={
+                  <Banner tone="critical" title="Failed to load product data">
+                    <p>Could not fetch products from Shopify. Please try refreshing the page.</p>
+                  </Banner>
+                }
+              >
+                {(resolved) => {
+                  const { products, totalImages, newImages, optimizedCount } = resolved as {
+                    products: Array<{ id: string; title: string }>;
+                    totalImages: number;
+                    newImages: number;
+                    optimizedCount: number;
+                  };
 
-            {/* Optimization progress card (hidden during active optimization) */}
-            {!isOptimizing && (
-              <Card>
-                <BlockStack gap="400">
-                  <Text as="h2" variant="headingMd">Optimization Progress</Text>
-                  <ProgressBar progress={completionPercentage} size="small" />
-                  <BlockStack gap="200">
-                    <Text as="p">Total images: {totalImages}</Text>
-                    <Text as="p">
-                      Optimized: {optimizedCount} | Failed: {statsMap.failed}
-                    </Text>
-                  </BlockStack>
-                  <InlineStack gap="300">
-                    <Button
-                      variant="primary"
-                      onClick={handleOptimizeNew}
-                      size="large"
-                      disabled={newImages === 0}
-                    >
-                      {newImages > 0
-                        ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
-                        : "No New Images to Optimize"}
-                    </Button>
-                    {optimizedCount > 0 && (
-                      <Button
-                        tone="critical"
-                        onClick={() => setShowRevertModal(true)}
-                        loading={isReverting}
-                      >
-                        Revert All to Originals
-                      </Button>
-                    )}
-                  </InlineStack>
-                </BlockStack>
-              </Card>
-            )}
+                  const completionPercentage = totalImages > 0 ? Math.min((optimizedCount / totalImages) * 100, 100) : 0;
 
-            {/* Recent optimizations table */}
-            <OptimizationsTable
-              optimizations={recentOptimizations}
-              productMap={productMap}
-              isReverting={isReverting}
-              isRetrying={isRetrying}
-              onCompare={setCompareImage}
-              onRevert={handleRevertSingle}
-              onRetry={handleRetrySingle}
-            />
+                  // Product name lookup
+                  const productMap: Record<string, string> = {};
+                  for (const p of products) {
+                    productMap[p.id] = p.title;
+                  }
+
+                  return (
+                    <>
+                      {newImages > 0 && !isOptimizing && (
+                        <Banner tone="info">
+                          <p>
+                            Found {newImages} new image{newImages !== 1 ? "s" : ""} ready to optimize.
+                          </p>
+                        </Banner>
+                      )}
+
+                      {/* Optimization progress card (hidden during active optimization) */}
+                      {!isOptimizing && (
+                        <Card>
+                          <BlockStack gap="400">
+                            <Text as="h2" variant="headingMd">Optimization Progress</Text>
+                            <ProgressBar progress={completionPercentage} size="small" />
+                            <BlockStack gap="200">
+                              <Text as="p">Total images: {totalImages}</Text>
+                              <Text as="p">
+                                Optimized: {optimizedCount} | Failed: {statsMap.failed}
+                              </Text>
+                            </BlockStack>
+                            <InlineStack gap="300">
+                              <Button
+                                variant="primary"
+                                onClick={handleOptimizeNew}
+                                size="large"
+                                disabled={newImages === 0}
+                              >
+                                {newImages > 0
+                                  ? `Optimize ${newImages} New Image${newImages !== 1 ? "s" : ""}`
+                                  : "No New Images to Optimize"}
+                              </Button>
+                              {optimizedCount > 0 && (
+                                <Button
+                                  tone="critical"
+                                  onClick={() => setShowRevertModal(true)}
+                                  loading={isReverting}
+                                >
+                                  Revert All to Originals
+                                </Button>
+                              )}
+                            </InlineStack>
+                          </BlockStack>
+                        </Card>
+                      )}
+
+                      {/* Recent optimizations table */}
+                      <OptimizationsTable
+                        optimizations={recentOptimizations}
+                        productMap={productMap}
+                        isReverting={isReverting}
+                        isRetrying={isRetrying}
+                        onCompare={setCompareImage}
+                        onRevert={handleRevertSingle}
+                        onRetry={handleRetrySingle}
+                      />
+                    </>
+                  );
+                }}
+              </Await>
+            </Suspense>
           </BlockStack>
         </Layout.Section>
       </Layout>
@@ -608,6 +618,39 @@ export default function ImageOptimizer() {
         <CompareModal image={compareImage} onClose={() => setCompareImage(null)} />
       )}
     </Page>
+  );
+}
+
+// ─── Loading Skeleton ─────────────────────────────────────────────────────────
+
+function ProductDataSkeleton() {
+  return (
+    <BlockStack gap="500">
+      <Card>
+        <BlockStack gap="400">
+          <SkeletonDisplayText size="small" />
+          <SkeletonBodyText lines={1} />
+          <div style={{ height: "8px", background: "#e4e5e7", borderRadius: "4px" }} />
+          <SkeletonBodyText lines={2} />
+          <div style={{ display: "flex", gap: "12px" }}>
+            <div
+              style={{
+                width: "200px",
+                height: "36px",
+                background: "#e4e5e7",
+                borderRadius: "8px",
+              }}
+            />
+          </div>
+        </BlockStack>
+      </Card>
+      <Card>
+        <BlockStack gap="400">
+          <SkeletonDisplayText size="small" />
+          <SkeletonBodyText lines={4} />
+        </BlockStack>
+      </Card>
+    </BlockStack>
   );
 }
 
@@ -772,7 +815,7 @@ function OptimizationsTable({
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
               <thead>
-                <tr style={{ borderBottom: "1px solid #e1e3e5", textAlign: "left" }}>
+                <tr style={{ borderBottom: "2px solid #e1e3e5", textAlign: "left" }}>
                   <th style={{ padding: "12px 8px" }}>Preview</th>
                   <th style={{ padding: "12px 8px" }}>Product</th>
                   <th style={{ padding: "12px 8px" }}>Status</th>
