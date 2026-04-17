@@ -56,6 +56,7 @@ export default function App() {
           Home
         </Link>
         <Link to="/app/image-optimizer">Image Optimizer</Link>
+        <Link to="/app/image-browser">Image Browser</Link>
         <Link to="/app/settings">SEO Settings</Link>
         <Link to="/app/billing">Billing</Link>
       </NavMenu>
