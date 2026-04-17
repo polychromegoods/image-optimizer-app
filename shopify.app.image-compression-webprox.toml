@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "9ddb43fea29f33789bda9e4c9c3bf710"
+client_id = "794436d5bcaf0d9b36d3a7a4971bbbe7"
 name = "Image Compression WebProX"
 application_url = "https://image-optimizer-app-production.up.railway.app"
 embedded = true
