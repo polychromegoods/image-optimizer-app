@@ -45,6 +45,8 @@ model ImageOptimization {
   webpUrl         String?
   webpGid         String?
   newMediaId      String?  // The new WebP media GID after optimization (for dedup on refresh)
+  originalPosition Int?    // Zero-based position of the original media in the product
+  variantIds      String?  // Comma-separated variant IDs that referenced this media
   status          String   @default("pending")
   fileSize        Int?
   webpFileSize    Int?

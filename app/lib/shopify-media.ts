@@ -5,6 +5,10 @@ import {
   MUTATION_PRODUCT_DELETE_MEDIA,
   MUTATION_PRODUCT_CREATE_MEDIA,
   QUERY_PRODUCTS_WITH_MEDIA,
+  QUERY_PRODUCT_MEDIA_DETAILS,
+  MUTATION_PRODUCT_REORDER_MEDIA,
+  MUTATION_VARIANT_APPEND_MEDIA,
+  MUTATION_VARIANT_DETACH_MEDIA,
   PRODUCTS_PER_PAGE,
 } from "./constants";
 
@@ -185,6 +189,138 @@ export async function createProductMedia(
   }
 
   return { mediaId, imageUrl };
+}
+
+// ─── Position & Variant Preservation Helpers ─────────────────────────────────
+
+export interface MediaPositionInfo {
+  /** Zero-based position of this media in the product's media list */
+  position: number;
+  /** Variant IDs that reference this media */
+  variantIds: string[];
+}
+
+/**
+ * Query a product to get the position of a specific media item and which variants reference it.
+ */
+export async function getMediaPositionAndVariants(
+  admin: ShopifyAdmin,
+  productId: string,
+  mediaId: string,
+): Promise<MediaPositionInfo> {
+  const response = await admin.graphql(QUERY_PRODUCT_MEDIA_DETAILS, {
+    variables: { productId },
+  });
+  const data = await response.json();
+  const product = (data as any).data?.product;
+
+  // Find position (media is returned in position order)
+  const mediaEdges = product?.media?.edges || [];
+  let position = -1;
+  for (let i = 0; i < mediaEdges.length; i++) {
+    if (mediaEdges[i].node?.id === mediaId) {
+      position = i;
+      break;
+    }
+  }
+
+  // Find which variants reference this media
+  const variantIds: string[] = [];
+  const variantEdges = product?.variants?.edges || [];
+  for (const variantEdge of variantEdges) {
+    const variant = variantEdge.node;
+    const variantMediaEdges = variant?.media?.edges || [];
+    for (const vmEdge of variantMediaEdges) {
+      if (vmEdge.node?.id === mediaId) {
+        variantIds.push(variant.id);
+        break;
+      }
+    }
+  }
+
+  console.log(`[getMediaPositionAndVariants] Media ${mediaId} on product ${productId}: position=${position}, variants=${variantIds.length}`);
+  return { position, variantIds };
+}
+
+/**
+ * Reorder a media item to a specific position on a product.
+ */
+export async function reorderProductMedia(
+  admin: ShopifyAdmin,
+  productId: string,
+  mediaId: string,
+  newPosition: number,
+): Promise<void> {
+  console.log(`[reorderProductMedia] Moving media ${mediaId} to position ${newPosition} on product ${productId}`);
+  const response = await admin.graphql(MUTATION_PRODUCT_REORDER_MEDIA, {
+    variables: {
+      id: productId,
+      moves: [{ id: mediaId, newPosition: String(newPosition) }],
+    },
+  });
+  const data = await response.json();
+  const errors = (data as any).data?.productReorderMedia?.mediaUserErrors;
+  if (errors?.length > 0) {
+    console.error(`[reorderProductMedia] Errors:`, errors);
+    throw new Error(`Failed to reorder media: ${errors.map((e: any) => e.message).join(", ")}`);
+  }
+}
+
+/**
+ * Assign media to variants (append). This associates the media with the variant
+ * so it shows as the variant's image.
+ */
+export async function assignMediaToVariants(
+  admin: ShopifyAdmin,
+  productId: string,
+  mediaId: string,
+  variantIds: string[],
+): Promise<void> {
+  if (variantIds.length === 0) return;
+
+  console.log(`[assignMediaToVariants] Assigning media ${mediaId} to ${variantIds.length} variant(s) on product ${productId}`);
+  const variantMedia = variantIds.map((variantId) => ({
+    variantId,
+    mediaIds: [mediaId],
+  }));
+
+  const response = await admin.graphql(MUTATION_VARIANT_APPEND_MEDIA, {
+    variables: { productId, variantMedia },
+  });
+  const data = await response.json();
+  const errors = (data as any).data?.productVariantAppendMedia?.userErrors;
+  if (errors?.length > 0) {
+    console.error(`[assignMediaToVariants] Errors:`, errors);
+    // Non-fatal — log but don't throw
+  }
+}
+
+/**
+ * Detach media from variants before deleting the media.
+ */
+export async function detachMediaFromVariants(
+  admin: ShopifyAdmin,
+  productId: string,
+  mediaId: string,
+  variantIds: string[],
+): Promise<void> {
+  if (variantIds.length === 0) return;
+
+  console.log(`[detachMediaFromVariants] Detaching media ${mediaId} from ${variantIds.length} variant(s) on product ${productId}`);
+  const variantMedia = variantIds.map((variantId) => ({
+    variantId,
+    mediaIds: [mediaId],
+  }));
+
+  const response = await admin.graphql(MUTATION_VARIANT_DETACH_MEDIA, {
+    variables: { productId, variantMedia },
+  });
+  const data = await response.json();
+  const errors = (data as any).data?.productVariantDetachMedia?.userErrors;
+  if (errors?.length > 0) {
+    console.error(`[detachMediaFromVariants] Errors:`, errors);
+    // Non-fatal — log but don't throw
+  }
 }
 
 // ─── Product Parsing Helpers ───────────────────────────────────────────────────

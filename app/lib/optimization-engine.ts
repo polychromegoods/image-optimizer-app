@@ -7,7 +7,7 @@ import type {
 } from "./types";
 import { WEBP_QUALITY } from "./constants";
 import { applyTemplate, makeFileName, buildTemplateVariables, getMimeType, getExtensionFromUrl, extractIdFromGid } from "./templates";
-import { uploadBackupToFiles, uploadWebpImage, deleteProductMedia, createProductMedia, getProductImages } from "./shopify-media";
+import { uploadBackupToFiles, uploadWebpImage, deleteProductMedia, createProductMedia, getProductImages, getMediaPositionAndVariants, reorderProductMedia, assignMediaToVariants, detachMediaFromVariants } from "./shopify-media";
 import db from "../db.server";
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
@@ -144,7 +144,19 @@ export async function processSingleImage({
     return;
   }
 
-  // Step 3: Backup original to Shopify Files
+  // Step 3: Capture position and variant assignments BEFORE any changes
+  let originalPosition = -1;
+  let variantIds: string[] = [];
+  try {
+    const posInfo = await getMediaPositionAndVariants(admin, productId, media.id);
+    originalPosition = posInfo.position;
+    variantIds = posInfo.variantIds;
+    console.log(`[processSingleImage] Media ${media.id}: position=${originalPosition}, variants=${variantIds.join(",")}`);
+  } catch (posError) {
+    console.warn(`[processSingleImage] Could not get position/variant info for ${media.id}, will skip reorder:`, posError);
+  }
+
+  // Step 4: Backup original to Shopify Files
   const extension = getExtensionFromUrl(media.image.url);
   const backupFilename = `backup-${extractIdFromGid(media.id)}.${extension}`;
   const backupMimeType = getMimeType(extension);
@@ -157,7 +169,7 @@ export async function processSingleImage({
     throw new Error(`Backup failed for ${media.id}: ${backupError instanceof Error ? backupError.message : String(backupError)}`);
   }
 
-  // Step 4: Upload WebP (BEFORE deleting original — safe optimization)
+  // Step 5: Upload WebP (BEFORE deleting original — safe optimization)
   let webpResourceUrl: string;
   try {
     webpResourceUrl = await uploadWebpImage(admin, webpBuffer, fileName);
@@ -166,8 +178,7 @@ export async function processSingleImage({
     throw new Error(`WebP upload failed for ${media.id}: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}`);
   }
 
-  // Step 5: Create new product media with WebP FIRST (before deleting original)
-  // This ensures the product always has images even if something fails
+  // Step 6: Create new product media with WebP FIRST (before deleting original)
   let newMediaId: string | null;
   let newImageUrl: string | null;
   try {
@@ -179,23 +190,45 @@ export async function processSingleImage({
     throw new Error(`Media creation failed for ${media.id}: ${createError instanceof Error ? createError.message : String(createError)}`);
   }
 
-  // Step 6: Delete original product media ONLY after WebP is successfully attached
+  // Step 7: Detach original media from variants before deleting
+  if (variantIds.length > 0) {
+    try {
+      await detachMediaFromVariants(admin, productId, media.id, variantIds);
+    } catch (detachError) {
+      console.warn(`[processSingleImage] Could not detach original from variants:`, detachError);
+    }
+  }
+
+  // Step 8: Delete original product media ONLY after WebP is successfully attached
   try {
     await deleteProductMedia(admin, productId, [media.id]);
   } catch (deleteError) {
-    // Non-fatal: the product now has both original and WebP
-    // We still record the optimization as completed
     console.warn(`Warning: Could not delete original media ${media.id} (product may have duplicate):`, deleteError);
   }
 
-  // Step 7: Update database record
+  // Step 9: Assign WebP media to the same variants the original had
+  if (newMediaId && variantIds.length > 0) {
+    try {
+      await assignMediaToVariants(admin, productId, newMediaId, variantIds);
+    } catch (assignError) {
+      console.warn(`[processSingleImage] Could not assign WebP to variants:`, assignError);
+    }
+  }
+
+  // Step 10: Reorder WebP media to the original position
+  if (newMediaId && originalPosition >= 0) {
+    try {
+      await reorderProductMedia(admin, productId, newMediaId, originalPosition);
+    } catch (reorderError) {
+      console.warn(`[processSingleImage] Could not reorder WebP to position ${originalPosition}:`, reorderError);
+    }
+  }
+
+  // Step 11: Update database record
   const savings = originalSize - webpSize;
   progress.totalSaved += savings;
   progress.processedCount++;
 
-  // BUG-009 FIX: Store newMediaId on the SAME record instead of creating a duplicate.
-  // This single record tracks the full lifecycle: original → optimized.
-  // The newMediaId field lets countImagesToProcess recognize the WebP image on refresh.
   await db.imageOptimization.update({
     where: { shop_imageId: { shop, imageId: media.id } },
     data: {
@@ -207,6 +240,8 @@ export async function processSingleImage({
       webpFileSize: webpSize,
       status: "completed",
       altTextUpdated: seoSettings?.autoApplyOnOptimize ?? false,
+      originalPosition: originalPosition >= 0 ? originalPosition : null,
+      variantIds: variantIds.length > 0 ? variantIds.join(",") : null,
     },
   });
 
@@ -387,40 +422,86 @@ export async function revertSingleOptimization(
     backupUrl: string | null;
     originalUrl: string;
     originalAlt: string | null;
+    originalPosition: number | null;
+    variantIds: string | null;
   },
 ): Promise<void> {
   const restoreSource = opt.backupUrl || opt.originalUrl;
 
   if (!restoreSource) {
     console.error(`Cannot revert ${opt.imageId}: no backup URL or original URL available`);
-    // Still clean up the DB record so it doesn't block future operations
     await db.imageOptimization.delete({ where: { id: opt.id } });
     return;
   }
 
+  // Parse stored variant IDs
+  const storedVariantIds = opt.variantIds ? opt.variantIds.split(",").filter(Boolean) : [];
+  const storedPosition = opt.originalPosition ?? -1;
+
+  // If we don't have stored position/variant info, try to get it from the current WebP media
+  let currentVariantIds = storedVariantIds;
+  let currentPosition = storedPosition;
+  const webpMediaId = opt.newMediaId || opt.webpGid;
+
+  if (webpMediaId && (currentPosition < 0 || currentVariantIds.length === 0)) {
+    try {
+      const posInfo = await getMediaPositionAndVariants(admin, opt.productId, webpMediaId);
+      if (currentPosition < 0) currentPosition = posInfo.position;
+      if (currentVariantIds.length === 0) currentVariantIds = posInfo.variantIds;
+      console.log(`[Revert] Got live position/variant info for WebP ${webpMediaId}: position=${currentPosition}, variants=${currentVariantIds.join(",")}`);
+    } catch (posError) {
+      console.warn(`[Revert] Could not get position/variant info for WebP ${webpMediaId}:`, posError);
+    }
+  }
+
   // SAFE REVERT: Restore original FIRST, then delete WebP
-  // This ensures the product always has at least one image
   console.log(`[Revert] Restoring original for ${opt.imageId} from: ${restoreSource}`);
+  let restoredMediaId: string | null = null;
   try {
-    await createProductMedia(admin, opt.productId, restoreSource, opt.originalAlt || "");
+    const result = await createProductMedia(admin, opt.productId, restoreSource, opt.originalAlt || "");
+    restoredMediaId = result.mediaId;
   } catch (restoreError) {
     console.error(`Failed to restore original for ${opt.imageId}:`, restoreError);
     throw new Error(`Revert failed: could not restore original image. WebP version preserved. Error: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
   }
 
-  // Now delete the WebP media (safe because original is already restored)
-  const mediaToDelete = opt.newMediaId || opt.webpGid;
-  if (mediaToDelete) {
+  // Detach WebP from variants before deleting
+  if (webpMediaId && currentVariantIds.length > 0) {
     try {
-      await deleteProductMedia(admin, opt.productId, [mediaToDelete]);
-    } catch (e) {
-      // Non-fatal: product now has both original and WebP
-      console.warn(`Warning: Could not delete WebP media ${mediaToDelete} (product may have duplicate):`, e);
+      await detachMediaFromVariants(admin, opt.productId, webpMediaId, currentVariantIds);
+    } catch (detachError) {
+      console.warn(`[Revert] Could not detach WebP from variants:`, detachError);
     }
   }
 
-  // BUG-004 FIX: Delete the optimization record so the restored image
-  // will be detected as "new" on next refresh
+  // Delete the WebP media (safe because original is already restored)
+  if (webpMediaId) {
+    try {
+      await deleteProductMedia(admin, opt.productId, [webpMediaId]);
+    } catch (e) {
+      console.warn(`Warning: Could not delete WebP media ${webpMediaId} (product may have duplicate):`, e);
+    }
+  }
+
+  // Assign restored media to the same variants
+  if (restoredMediaId && currentVariantIds.length > 0) {
+    try {
+      await assignMediaToVariants(admin, opt.productId, restoredMediaId, currentVariantIds);
+    } catch (assignError) {
+      console.warn(`[Revert] Could not assign restored media to variants:`, assignError);
+    }
+  }
+
+  // Reorder restored media to the original position
+  if (restoredMediaId && currentPosition >= 0) {
+    try {
+      await reorderProductMedia(admin, opt.productId, restoredMediaId, currentPosition);
+    } catch (reorderError) {
+      console.warn(`[Revert] Could not reorder restored media to position ${currentPosition}:`, reorderError);
+    }
+  }
+
+  // Delete the optimization record so the restored image is detected as "new" on next refresh
   await db.imageOptimization.delete({
     where: { id: opt.id },
   });
