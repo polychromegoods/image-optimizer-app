@@ -149,6 +149,9 @@ export async function deleteProductMedia(
 /**
  * Create new media on a product from a source URL.
  * Returns the new media ID and image URL.
+ *
+ * Includes retry logic for Shopify's "currently being modified" lock error,
+ * which occurs when multiple media operations run on the same product concurrently.
  */
 export async function createProductMedia(
   admin: ShopifyAdmin,
@@ -156,39 +159,58 @@ export async function createProductMedia(
   sourceUrl: string,
   altText: string,
 ): Promise<{ mediaId: string | null; imageUrl: string | null }> {
-  const response = await admin.graphql(MUTATION_PRODUCT_CREATE_MEDIA, {
-    variables: {
-      productId,
-      media: [
-        {
-          alt: altText,
-          mediaContentType: "IMAGE",
-          originalSource: sourceUrl,
-        },
-      ],
-    },
-  });
+  const MAX_RETRIES = 3;
+  const BASE_DELAY_MS = 3000; // 3 seconds between retries
 
-  const data = await response.json();
-  const errors = data.data?.productCreateMedia?.mediaUserErrors;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const response = await admin.graphql(MUTATION_PRODUCT_CREATE_MEDIA, {
+      variables: {
+        productId,
+        media: [
+          {
+            alt: altText,
+            mediaContentType: "IMAGE",
+            originalSource: sourceUrl,
+          },
+        ],
+      },
+    });
 
-  if (errors?.length > 0) {
-    const errorMsg = errors.map((e: { message: string }) => e.message).join(", ");
-    throw new Error(`Failed to create product media: ${errorMsg}`);
+    const data = await response.json();
+    const errors = data.data?.productCreateMedia?.mediaUserErrors;
+
+    if (errors?.length > 0) {
+      const errorMsg = errors.map((e: { message: string }) => e.message).join(", ");
+
+      // Check if this is a "currently being modified" lock error — retryable
+      const isLockError = errorMsg.toLowerCase().includes("currently being modified");
+
+      if (isLockError && attempt < MAX_RETRIES) {
+        const delay = BASE_DELAY_MS * attempt;
+        console.warn(`[createProductMedia] Product ${productId} is locked (attempt ${attempt}/${MAX_RETRIES}). Retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      throw new Error(`Failed to create product media: ${errorMsg}`);
+    }
+
+    const newMedia = data.data?.productCreateMedia?.media?.[0];
+    const mediaId = newMedia?.id || null;
+    const imageUrl = newMedia?.image?.url || null;
+
+    // SAFETY: If Shopify returned no media ID, the image was not actually attached
+    // to the product. Treat this as a failure to prevent silent data loss.
+    if (!mediaId) {
+      console.error(`[createProductMedia] Shopify returned no media ID for product ${productId}. Response:`, JSON.stringify(data.data?.productCreateMedia));
+      throw new Error(`Product media creation returned no media ID for product ${productId}. The image may not have been attached.`);
+    }
+
+    return { mediaId, imageUrl };
   }
 
-  const newMedia = data.data?.productCreateMedia?.media?.[0];
-  const mediaId = newMedia?.id || null;
-  const imageUrl = newMedia?.image?.url || null;
-
-  // SAFETY: If Shopify returned no media ID, the image was not actually attached
-  // to the product. Treat this as a failure to prevent silent data loss.
-  if (!mediaId) {
-    console.error(`[createProductMedia] Shopify returned no media ID for product ${productId}. Response:`, JSON.stringify(data.data?.productCreateMedia));
-    throw new Error(`Product media creation returned no media ID for product ${productId}. The image may not have been attached.`);
-  }
-
-  return { mediaId, imageUrl };
+  // Should never reach here, but TypeScript needs it
+  throw new Error(`Failed to create product media after ${MAX_RETRIES} attempts`);
 }
 
 // ─── Position & Variant Preservation Helpers ─────────────────────────────────

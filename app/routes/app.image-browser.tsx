@@ -18,10 +18,6 @@ import {
   Banner,
   Icon,
   EmptyState,
-  Filters,
-  ChoiceList,
-  Box,
-  InlineGrid,
   Divider,
 } from "@shopify/polaris";
 import { SearchIcon } from "@shopify/polaris-icons";
@@ -55,6 +51,59 @@ interface Product {
   images: ProductImage[];
 }
 
+// ─── Per-Product Queue ──────────────────────────────────────────────────────────
+
+/**
+ * A simple per-product queue that ensures only one compress/revert operation
+ * runs at a time per product. This prevents Shopify's "Media cannot be modified
+ * because it is currently being modified by another operation" error.
+ */
+class ProductOperationQueue {
+  private queues: Map<string, Array<() => Promise<void>>> = new Map();
+  private running: Map<string, boolean> = new Map();
+
+  async enqueue(productId: string, operation: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const wrappedOp = async () => {
+        try {
+          await operation();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      if (!this.queues.has(productId)) {
+        this.queues.set(productId, []);
+      }
+      this.queues.get(productId)!.push(wrappedOp);
+      this.processNext(productId);
+    });
+  }
+
+  private async processNext(productId: string) {
+    if (this.running.get(productId)) return;
+
+    const queue = this.queues.get(productId);
+    if (!queue || queue.length === 0) return;
+
+    this.running.set(productId, true);
+    const nextOp = queue.shift()!;
+
+    try {
+      await nextOp();
+    } catch {
+      // Error already handled by the wrapped operation
+    }
+
+    // Small delay between operations on the same product to let Shopify settle
+    await new Promise((r) => setTimeout(r, 1500));
+
+    this.running.set(productId, false);
+    this.processNext(productId);
+  }
+}
+
 // ─── Loader ─────────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -81,6 +130,9 @@ export default function ImageBrowser() {
   const [compressingImages, setCompressingImages] = useState<Set<string>>(new Set());
   const [revertingImages, setRevertingImages] = useState<Set<string>>(new Set());
   const [actionResults, setActionResults] = useState<Map<string, { success: boolean; message: string }>>(new Map());
+
+  // Per-product operation queue (persists across renders)
+  const queueRef = useRef(new ProductOperationQueue());
 
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -139,8 +191,8 @@ export default function ImageBrowser() {
     [fetchProducts],
   );
 
-  // ── Compress single image ──
-  const handleCompress = useCallback(async (imageId: string, productId: string) => {
+  // ── Core compress logic (called inside the queue) ──
+  const doCompress = useCallback(async (imageId: string, productId: string) => {
     setCompressingImages((prev) => new Set(prev).add(imageId));
     setActionResults((prev) => {
       const next = new Map(prev);
@@ -159,7 +211,6 @@ export default function ImageBrowser() {
       const data = await resp.json();
 
       if (data.success) {
-        // Update the product's image status in state
         setProducts((prev) =>
           prev.map((p) => ({
             ...p,
@@ -194,8 +245,29 @@ export default function ImageBrowser() {
     }
   }, []);
 
-  // ── Revert single image ──
-  const handleRevert = useCallback(async (imageId: string, optimizationId: string) => {
+  // ── Compress single image (queued per product) ──
+  const handleCompress = useCallback(
+    (imageId: string, productId: string) => {
+      // Mark as queued immediately for UI feedback
+      setCompressingImages((prev) => new Set(prev).add(imageId));
+
+      // Enqueue the operation — it will run when the product's queue is free
+      queueRef.current.enqueue(productId, async () => {
+        await doCompress(imageId, productId);
+      }).catch(() => {
+        // Error already handled inside doCompress
+        setCompressingImages((prev) => {
+          const next = new Set(prev);
+          next.delete(imageId);
+          return next;
+        });
+      });
+    },
+    [doCompress],
+  );
+
+  // ── Core revert logic (called inside the queue) ──
+  const doRevert = useCallback(async (imageId: string, optimizationId: string) => {
     setRevertingImages((prev) => new Set(prev).add(imageId));
     setActionResults((prev) => {
       const next = new Map(prev);
@@ -214,7 +286,6 @@ export default function ImageBrowser() {
       const data = await resp.json();
 
       if (data.success) {
-        // Update the product's image status in state
         setProducts((prev) =>
           prev.map((p) => ({
             ...p,
@@ -250,14 +321,33 @@ export default function ImageBrowser() {
     }
   }, []);
 
-  // ── Compress all new images for a product ──
+  // ── Revert single image (queued per product) ──
+  const handleRevert = useCallback(
+    (imageId: string, optimizationId: string, productId: string) => {
+      setRevertingImages((prev) => new Set(prev).add(imageId));
+
+      queueRef.current.enqueue(productId, async () => {
+        await doRevert(imageId, optimizationId);
+      }).catch(() => {
+        setRevertingImages((prev) => {
+          const next = new Set(prev);
+          next.delete(imageId);
+          return next;
+        });
+      });
+    },
+    [doRevert],
+  );
+
+  // ── Compress all new images for a product (queued sequentially) ──
   const handleCompressAllForProduct = useCallback(
-    async (product: Product) => {
+    (product: Product) => {
       const newImages = product.images.filter(
         (img) => img.optimizationStatus === "new" || img.optimizationStatus === "failed",
       );
+      // Each image is enqueued individually — the queue ensures sequential execution
       for (const img of newImages) {
-        await handleCompress(img.id, product.id);
+        handleCompress(img.id, product.id);
       }
     },
     [handleCompress],
@@ -451,7 +541,7 @@ function ProductImageCard({
   revertingImages: Set<string>;
   actionResults: Map<string, { success: boolean; message: string }>;
   onCompress: (imageId: string, productId: string) => void;
-  onRevert: (imageId: string, optimizationId: string) => void;
+  onRevert: (imageId: string, optimizationId: string, productId: string) => void;
   onCompressAll: (product: Product) => void;
 }) {
   const newImages = product.images.filter(
@@ -556,7 +646,7 @@ function ImageTile({
   isReverting: boolean;
   actionResult?: { success: boolean; message: string };
   onCompress: (imageId: string, productId: string) => void;
-  onRevert: (imageId: string, optimizationId: string) => void;
+  onRevert: (imageId: string, optimizationId: string, productId: string) => void;
 }) {
   const statusBadge = (() => {
     switch (image.optimizationStatus) {
@@ -683,7 +773,7 @@ function ImageTile({
               <Button
                 size="slim"
                 tone="critical"
-                onClick={() => onRevert(image.id, image.optimizationId!)}
+                onClick={() => onRevert(image.id, image.optimizationId!, productId)}
                 loading={isReverting}
                 disabled={isCompressing}
               >
